@@ -1,0 +1,17 @@
+1. implement as spec decoding2 dflash/ddtree 
+2. kernel, gpu programming, triton
+3. flash attn, flashinfer kernel implementation
+4. profiling
+5. paged attention kernel implemenation
+6. block diffusion model
+7. sglang router/gateway, mooncake
+8. KV cache qunatization - Turboquant
+9. Parlallelism 
+10. disaggregation
+11. advacnced scheduling
+12. kernel fusion and compile, cuda graphs
+13. streaming
+14. MOE 
+15. quantiztaion 2 -> GP8, AWQ
+16. sampling advanced, triton
+17. LORA 
