@@ -1,127 +1,174 @@
-# Layer 10 — Batched Prefill + Chunked Prefill
+# Layer 12 — GPTQ Quantization
 
-Builds on Layer 9 (paged KV cache, `page_size=16`) by replacing the B=1 sequential prefill loop with:
+Builds on Layer 11 (prefix caching) by adding **4-bit GPTQ quantization** support. The model weights
+are stored as packed int4 values and dequantized on-the-fly during the matrix multiply using the
+`sgl_kernel.gptq_gemm` fused CUDA kernel (ExLlama v2).
 
-1. **Batched prefill** — multiple requests packed into one EXTEND forward pass  
-2. **Chunked prefill** — long prompts split across rounds, interleaved with decode
+- **Quantized model**: `JunHowie/Qwen3-0.6B-GPTQ-Int4`
+- **Baseline model**: `Qwen/Qwen3-0.6B` (fp16/bf16 reference)
+- **Kernel**: `sgl_kernel.gptq_gemm` — fused int4 dequant + GEMM in one CUDA kernel
 
 ---
 
-## What changed from Layer 9
+## How GPTQ quantization works
 
-| Component | Layer 9 | Layer 10 |
-|-----------|---------|---------|
-| Prefill batch size | B=1, one at a time | B=N, all new reqs together |
-| Prefill kernel | F.sdpa (full causal) | `BatchPrefillWithPagedKVCacheWrapper` |
-| Chunked prefill | ✗ | ✓ (`chunked_prefill_size` param) |
-| `PrefillKVCtx` | Used for B=1 | Removed |
-| `ExtendKVCtx` | — | New: handles first chunk, continuation, batched |
-| Page packing | ✗ | ✓ (chunks continue filling partial pages) |
-| `Req.fill_ids` | — | Token slice for this extend round |
-| `Req.kv_committed_len` | — | Tokens already in KV pool |
-| `Scheduler.chunked_req` | — | In-flight chunked request state |
-| `PrefillAdder` | — | Builds extend batch (token budget, chunk logic) |
+### Weight layout
+
+Each `nn.Linear` is replaced by a `GPTQLinear` that stores 4 quantized buffers instead of one float weight matrix:
+
+```
+qweight : [K // 8,         N]   int32   — 8 int4 values packed per int32, column-major
+scales  : [K // group_size, N]  float16 — one fp16 scale per group of `group_size` input rows
+qzeros  : [K // group_size, N // 8]  int32  — zero-points packed same as qweight
+g_idx   : [K]               int32   — maps each input row to its scale/zero group (all-zeros for desc_act=False)
+```
+
+For Qwen3-0.6B with `group_size=128`:
+- MLP `gate_proj` qweight: `[1024 // 8, 3072] = [128, 3072]` int32
+- MLP `down_proj` qweight: `[3072 // 8, 1024] = [384, 1024]` int32
+
+### Forward pass
+
+```python
+# gptq_gemm dequantizes on-the-fly and performs the matmul in one kernel:
+#   w_fp = (qweight_unpacked - qzeros) * scales
+# Activations must be float16 (not bfloat16) for correct kernel behavior.
+
+x_fp16 = x.to(torch.float16)
+y = gptq_gemm(x_fp16, qweight, qzeros, scales, g_idx_seq,
+              use_shuffle=False, bits=4)
+return y.to(orig_dtype)   # cast back to bf16
+```
+
+### Memory savings
+
+| Model | Format | GPU memory |
+|-------|--------|------------|
+| Qwen3-0.6B | fp16/bf16 | ~1.2 GB |
+| Qwen3-0.6B-GPTQ-Int4 | 4-bit | ~600 MB |
+
+4× weight compression (int4 vs fp16), activations remain bf16.
+
+---
+
+## What changed from Layer 11
+
+| Component | Layer 11 | Layer 12 |
+|-----------|----------|----------|
+| Linear layers | `nn.Linear` (fp16/bf16) | `GPTQLinear` (int4 packed weights) |
+| Model package | `model/` | `model_gptq/` (new parallel package) |
+| Weight loading | `named_parameters()` only | `named_parameters()` + `named_buffers()` |
+| Dtype handling | `model.to(bf16)` on all tensors | Parameters → bf16, int32/fp16 buffers preserved |
+| Config loading | `config.json` only | `config.json` + `quantize_config.json` |
+| Kernel | `F.linear` / FlashInfer | `sgl_kernel.gptq_gemm` for linear layers |
+| `verify_gptq.py` | — | **New**: 4-test correctness check |
 
 ---
 
 ## Architecture
 
-### Unified `ExtendKVCtx`
+### `model_gptq/` — parallel quantized model package
 
-Replaces `PrefillKVCtx`. One type handles all cases:
-
-```
-Case 1: Full prefill, B=1     kv_committed_len=0, fill_ids=input_ids
-Case 2: Batched prefill, B=N  kv_committed_len=0 for all, packed
-Case 3: Continuation chunk    kv_committed_len>0, fill_ids=chunk_slice
-```
-
-All three go through `BatchPrefillWithPagedKVCacheWrapper(causal=True)`.
-
-### Page packing across chunk boundaries
-
-Without page packing, each chunk independently allocates pages:
-```
-P=16, chunk_size=24
-Chunk 0 → 2 pages (0..15 full, 16..23 partial)
-Chunk 1 → 2 MORE pages (not continuing page 2!)
-= 4 pages for 48 tokens, kv_last_page_len is wrong
-```
-
-With page packing (Layer 10):
-```
-Chunk 0 → pages [1, 2]:  page 1 full (16 tokens), page 2 partial (8 tokens)
-Chunk 1 → FILL page 2 first (8 more tokens), then allocate page 3 (16 tokens)
-= 3 pages for 48 tokens, kv_last_page_len=16 correct
-```
-
-Invariant maintained: `len(slot_indices) == ceil(total_committed / P)`
-
-### Scheduler flow
+A complete copy of the `model/` package where `nn.Linear` is replaced by `GPTQLinear` in attention and MLP:
 
 ```
-Round k:
-  1. PrefillAdder.build()
-     - If chunked_req set: continue it (return [chunked_req])
-     - Else: pick N requests up to max_prefill_tokens budget
-             If a request needs chunking: set chunked_req, return [req]
-  2. model_runner.prefill_batch(batch)
-     - For each req: compute_write_info() → page packing → rtp update
-     - Pack all fill_ids → forward with ExtendKVCtx
-     - After last chunk: sample first token, RUNNING/FINISHED
-     - Mid-chunk: PREFILLING, stay in chunked_req
-  3. model_runner.decode_step(running)  ← runs in parallel with chunked prefill!
+model_gptq/
+├── gptq_linear.py     — GPTQLinear: 4-bit weight buffers + gptq_gemm forward
+├── qwen3.py           — Qwen3ForCausalLM (GPTQ): load weights, quantize_config, prepare()
+├── attention.py       — Qwen3Attention: q/k/v/o projections → GPTQLinear
+├── mlp.py             — Qwen3MLP: gate/up/down projections → GPTQLinear
+├── decoder_layer.py   — unchanged structure, uses quantized attention + MLP
+├── config.py          — unchanged
+├── norm.py            — unchanged (RMSNorm stays fp)
+└── rope.py            — unchanged (RoPE stays fp)
 ```
 
-Chunked requests are NOT in the decode batch during prefill — they join only after the last chunk completes.
+`lm_head` and `embed_tokens` are **not quantized** (matches `quantize_config.json: "lm_head": false`).
 
-### `causal=True` in both `begin_forward` and `forward`
+### `GPTQLinear` — key design decisions
 
-FlashInfer 0.6.x has `causal` as a parameter on both `begin_forward` AND `forward`. Passing it only to `begin_forward` does not apply causal masking — it must be passed to `forward(q, kv, causal=True)` as well.
+**Buffers, not parameters**: The four GPTQ tensors (`qweight`, `scales`, `qzeros`, `g_idx`) are registered as `nn.Module` buffers. This means:
+- `model.to(dtype)` skips them — int32 stays int32, fp16 stays fp16
+- `optimizer` ignores them — no gradients
+- `named_parameters()` does NOT enumerate them — `load_weights()` must also call `named_buffers()`
+
+**fp16 scales**: `gptq_gemm` reads scale bits as `float16` internally. If scales are cast to `bfloat16` (e.g. by a naïve `model.to(bf16)` call), the bit patterns are reinterpreted and produce completely wrong outputs. Scales are kept as `torch.float16` permanently.
+
+**Activation dtype**: `gptq_gemm` only produces correct results with `float16` activations. The layer casts `x → fp16` before the kernel call and casts the result back to the original dtype (usually `bfloat16`).
+
+**`use_shuffle=False`**: Uses the raw packed `qweight` directly without pre-processing via `gptq_shuffle`. The `prepare()` method marks the layer ready (no-op currently) for forward compatibility.
+
+### `from_pretrained()` loading sequence
+
+```
+1. Resolve model path (HF Hub or local dir)
+2. Read config.json → Qwen3Config
+3. Read quantize_config.json → bits=4, group_size=128
+4. Build model on CPU with GPTQLinear layers (empty buffers)
+5. Stream weights from model.safetensors:
+     - fp tensors (scales, norms, embed) → kept as native dtype
+     - int32 tensors (qweight, qzeros, g_idx) → kept as int32
+     (DO NOT call .to(dtype) on int32 tensors — corrupts packed bits)
+6. Cast floating PARAMETERS to bf16
+     (deliberately skips buffers so scales stay fp16)
+7. Move to CUDA — buffers keep their dtypes
+8. Call GPTQLinear.prepare() on all layers
+9. Set eval mode
+```
 
 ---
 
-## Files changed
+## Files
 
-| File | Change |
-|------|--------|
-| `request.py` | `ReqStatus.PREFILLING`, `fill_ids`, `kv_committed_len`, `extend_input_len`, `is_last_chunk` |
-| `kv_cache.py` | `ExtendKVCtx` (replaces `PrefillKVCtx`), `WriteInfo`, `compute_write_info()` |
-| `model/attention.py` | `ExtendKVCtx` branch: paged prefill via `BatchPrefillWithPagedKVCacheWrapper` |
-| `model_runner.py` | `prefill_batch(reqs)` replaces `prefill(req)`, uses `compute_write_info` |
-| `scheduler.py` | `PrefillAdder`, `chunked_req` state machine, `chunked_prefill_size` param |
-| `verify_batch.py` | 3 tests: batched prefill, chunked prefill, chunked→decode |
-
----
-
-## Benchmark
-
-Layer 10 throughput is comparable to Layer 9 (same `chunked_prefill_size=0` default,
-so no chunking in the benchmark — the new infrastructure is in place but not exercised
-by the constant-concurrency benchmark which uses short prompts):
-
-| Metric | Layer 9 | Layer 10 |
-|--------|---------|---------|
-| Total wall time | 8.08s | 8.10s |
-| Output tok/s | 219.9 | 219.4 |
-| Total tok/s | 346.6 | 345.7 |
-| TTFT avg/p95 | 172ms / 739ms | 188ms / 808ms |
-| Latency avg/p95 | 1326ms / 2307ms | 1367ms / 2586ms |
-
-The slight TTFT increase is because `prefill_batch` now uses the paged prefill wrapper
-(which has more overhead than F.sdpa for short prompts) for ALL requests. The benefit
-of chunked prefill becomes visible with **long prompts** where the old B=1 sequential
-prefill blocked decode for hundreds of milliseconds.
+| File | Role |
+|------|------|
+| `model_gptq/gptq_linear.py` | **New** — `GPTQLinear`: packed int4 buffers, `gptq_gemm` forward, `prepare()` |
+| `model_gptq/qwen3.py` | **New** — GPTQ `Qwen3ForCausalLM`: `quantize_config.json`, buffer-aware `load_weights` |
+| `model_gptq/attention.py` | **New** — `Qwen3Attention` with `GPTQLinear` projections |
+| `model_gptq/mlp.py` | **New** — `Qwen3MLP` with `GPTQLinear` gate/up/down |
+| `model_gptq/` (rest) | **New** — config, norm, rope, decoder_layer (unchanged logic) |
+| `model_runner.py` | **Modified** — `gptq=True` flag to load `model_gptq` instead of `model` |
+| `verify_gptq.py` | **New** — 4 correctness tests: load, forward, greedy decode, fp16 comparison |
 
 ---
 
 ## Verify
 
 ```bash
-python verify_batch.py --model <path> --page-size 16 --chunk-size 24 --n-compare 8
-# All 3 tests PASS ✓
+python verify_gptq.py
 ```
 
-**Test 1** — Batched prefill (B=4, one EXTEND pass): max_diff < 0.55  
-**Test 2** — Chunked prefill (chunk_size=24, 5 chunks): max_diff < 0.40  
-**Test 3** — Chunked prefill → 8 decode steps: max_diff < 0.40
+**Test 1** — GPTQ model loads and uses < 700 MB GPU memory (vs ~1.2 GB for fp16)  
+**Test 2** — Forward pass: no NaN or Inf in logits  
+**Test 3** — Greedy decode produces valid token IDs  
+**Test 4** — (Optional) Top-1 token agreement with fp16 model; top-5 overlap ≥ 3/5
+
+---
+
+## Benchmark
+
+**Config**: 20 requests · concurrency=4 · max_tokens=128 · page_size=16
+
+| Metric | Value |
+|--------|-------|
+| Total wall time | 8.75s |
+| Output throughput | 203.0 tok/s |
+| Total throughput | 319.9 tok/s |
+| TTFT avg / p95 | 174ms / 721ms |
+| Latency avg / p95 | 1464ms / 2542ms |
+
+The GPTQ model runs at ~half the memory of the fp16 baseline with comparable throughput, since the
+bottleneck at this batch size is KV cache bandwidth and FlashInfer kernel overhead, not weight loading.
+The memory reduction matters most when fitting larger models or higher batch sizes on the same GPU.
+
+---
+
+## Key bugs fixed during implementation
+
+1. **`named_buffers()` missing from `load_weights`** — `GPTQLinear` stores its tensors as buffers, not parameters. Without explicitly iterating `named_buffers()`, all GPTQ tensors were silently skipped, leaving the model with uninitialized (garbage) weights.
+
+2. **int32 tensors cast to bfloat16** — The safetensors loader originally called `.to(dtype)` on every tensor unconditionally. Casting `qweight`/`qzeros`/`g_idx` (int32) to bfloat16 reinterprets the packed 4-bit values as bf16 bit patterns, producing completely wrong outputs. Fixed by preserving native dtype from checkpoint.
+
+3. **fp16 scales corrupted by `model.to(bf16)`** — `gptq_gemm` reads scale memory as raw fp16 bits. A global `model.to(bfloat16)` before loading corrupted scale buffers. Fixed by casting only floating-point `parameters` (not buffers) to bf16.
+
+4. **bfloat16 activations in `gptq_gemm`** — The kernel requires fp16 activations. Passing bf16 (the model's default dtype) yields drastically wrong outputs. Fixed by casting input to fp16 before the kernel call and casting the result back.
