@@ -18,11 +18,34 @@ import concurrent.futures
 import json
 import statistics
 import time
+from pathlib import Path
 
 import requests
+import yaml
+
+_HERE = Path(__file__).parent
+
+
+def _load_config(path: str) -> dict:
+    p = Path(path)
+    if not p.exists():
+        return {}
+    with open(p) as f:
+        return yaml.safe_load(f) or {}
+
+
+_pre = argparse.ArgumentParser(add_help=False)
+_pre.add_argument("--config", default=str(_HERE / "config.yml"))
+_pre_args, _ = _pre.parse_known_args()
+
+cfg = _load_config(_pre_args.config)
+
+_host = cfg.get("host", "localhost")
+_port = cfg.get("port", 8100)
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--url", default="http://localhost:8100")
+parser.add_argument("--config", default=str(_HERE / "config.yml"), help="Path to YAML config file")
+parser.add_argument("--url", default=f"http://{_host}:{_port}")
 parser.add_argument("--n", type=int, default=4, help="Number of concurrent requests")
 args = parser.parse_args()
 

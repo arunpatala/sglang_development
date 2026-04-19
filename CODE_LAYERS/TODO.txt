@@ -1,3 +1,10 @@
+A. add server config
+B. all test cases 
+C. max_tokens, max_seqs, etc 
+D. use lifespan fastapi instead of events
+E. config and flag driven multi feature  and combine into single repo
+
+0. advanced overlap scheduling
 1. implement as spec decoding2 dflash/ddtree 
 2. kernel, gpu programming, triton
 3. flash attn, flashinfer kernel implementation
@@ -15,3 +22,4 @@
 15. quantiztaion 2 -> GP8, AWQ
 16. sampling advanced, triton
 17. LORA 
+18. constrained decoding/xgrammar

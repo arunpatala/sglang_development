@@ -18,7 +18,9 @@ What is deliberately missing (to be added in later layers):
 
 Run:
     python server.py
-    python server.py --model /path/to/model --port 8100
+    python server.py --config config.yml          # explicit (same result)
+    python server.py --port 8200                  # override one param; rest from config.yml
+    python server.py --model /path/to/model
 
 Then in another terminal:
     python test_client.py
@@ -27,9 +29,11 @@ Then in another terminal:
 import argparse
 import logging
 import time
+from pathlib import Path
 
 import torch
 import uvicorn
+import yaml
 from fastapi import FastAPI
 from pydantic import BaseModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -38,19 +42,49 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# CLI
+# Config loading  (mirrors sglang's ConfigArgumentMerger pattern)
+# Precedence:  CLI args  >  config.yml  >  Python defaults below
 # ---------------------------------------------------------------------------
 
-DEFAULT_MODEL = (
-    "/home/arun/.cache/huggingface/hub/"
-    "models--Qwen--Qwen3-0.6B/snapshots/"
-    "c1899de289a04d12100db370d81485cdf75e47ca"
-)
+_HERE = Path(__file__).parent
+
+
+def load_config(path: str) -> dict:
+    """Load a YAML config file and return its contents as a dict."""
+    p = Path(path)
+    if not p.exists():
+        logger.warning(f"Config file not found: {p} — using CLI/default values only")
+        return {}
+    with open(p) as f:
+        data = yaml.safe_load(f)
+    return data or {}
+
+
+# ---------------------------------------------------------------------------
+# CLI  — we do a two-pass parse:
+#   Pass 1: extract --config (or default) to load the YAML.
+#   Pass 2: build the real parser with YAML values as defaults so CLI wins.
+# ---------------------------------------------------------------------------
+
+_pre = argparse.ArgumentParser(add_help=False)
+_pre.add_argument("--config", default=str(_HERE / "config.yml"))
+_pre_args, _ = _pre.parse_known_args()
+
+cfg = load_config(_pre_args.config)
 
 parser = argparse.ArgumentParser(description="Layer 0 — naive inference server")
-parser.add_argument("--model", default=DEFAULT_MODEL, help="Model path or HF hub id")
-parser.add_argument("--host", default="0.0.0.0")
-parser.add_argument("--port", type=int, default=8100)
+parser.add_argument("--config", default=str(_HERE / "config.yml"), help="Path to YAML config file")
+parser.add_argument("--model",     default=cfg.get("model",     "Qwen/Qwen3-0.6B"),   help="Model path or HF hub id")
+parser.add_argument("--host",      default=cfg.get("host",      "0.0.0.0"))
+parser.add_argument("--port",      default=cfg.get("port",      8100),                 type=int)
+parser.add_argument("--dtype",     default=cfg.get("dtype",     "bfloat16"),           help="Weight dtype (bfloat16 | float16 | float32)")
+parser.add_argument("--device",    default=cfg.get("device",    "cuda"))
+parser.add_argument("--log-level", default=cfg.get("log_level", "warning"),            help="Uvicorn log level")
+parser.add_argument("--use-cache", default=cfg.get("use_cache", False),                action="store_true",
+                    help="Enable HuggingFace KV cache (previews Layer 1 behaviour)")
+parser.add_argument("--max-new-tokens", default=cfg.get("max_new_tokens", 64),         type=int,  help="Default generation length when request omits it")
+parser.add_argument("--temperature",    default=cfg.get("temperature", 1.0),           type=float)
+
 # parse_known_args so uvicorn's own args don't cause errors
 args, _ = parser.parse_known_args()
 
@@ -58,14 +92,24 @@ args, _ = parser.parse_known_args()
 # Load model once at startup (blocking — that is fine here)
 # ---------------------------------------------------------------------------
 
-logger.info(f"Loading model from {args.model} ...")
+_DTYPE_MAP = {
+    "bfloat16": torch.bfloat16,
+    "float16":  torch.float16,
+    "float32":  torch.float32,
+}
+weight_dtype = _DTYPE_MAP.get(args.dtype, torch.bfloat16)
+
+logger.info(f"Config : {_pre_args.config}")
+logger.info(f"Model  : {args.model}")
+logger.info(f"Device : {args.device}  dtype={args.dtype}  use_cache={args.use_cache}")
+
 t_load = time.perf_counter()
 
 tokenizer = AutoTokenizer.from_pretrained(args.model)
 model = AutoModelForCausalLM.from_pretrained(
     args.model,
-    dtype=torch.bfloat16,
-).to("cuda")
+    torch_dtype=weight_dtype,
+).to(args.device)
 model.eval()
 
 logger.info(f"Model loaded in {time.perf_counter() - t_load:.1f}s")
@@ -81,8 +125,8 @@ class Message(BaseModel):
 
 class GenerateRequest(BaseModel):
     messages: list[Message]
-    max_new_tokens: int = 64
-    temperature: float = 1.0
+    max_new_tokens: int = args.max_new_tokens
+    temperature: float = args.temperature
 
 class GenerateResponse(BaseModel):
     text: str
@@ -136,7 +180,7 @@ def generate(req: GenerateRequest):
         add_generation_prompt=True,
         enable_thinking=False,
     )
-    input_ids = tokenizer(formatted, return_tensors="pt").input_ids.to("cuda")
+    input_ids = tokenizer(formatted, return_tensors="pt").input_ids.to(args.device)
 
     prompt_tokens = input_ids.shape[1]
     logger.info(f"prompt_tokens={prompt_tokens}")
@@ -144,15 +188,15 @@ def generate(req: GenerateRequest):
     # Step 2 — Generate
     # use_cache=True is the HuggingFace default: it still builds past_key_values
     # internally during generate(). We disable it here deliberately to show the
-    # true naive baseline. Toggle use_cache=True to see the Layer 1 speedup
-    # without even changing the server architecture.
+    # true naive baseline. Toggle use_cache=True (or set in config.yml) to see
+    # the Layer 1 speedup without even changing the server architecture.
     with torch.no_grad():
         output_ids = model.generate(
             input_ids,
             max_new_tokens=req.max_new_tokens,
             do_sample=(req.temperature > 0 and req.temperature != 1.0),
             temperature=req.temperature if req.temperature != 1.0 else None,
-            use_cache=False,  # <-- the defining choice of Layer 0
+            use_cache=args.use_cache,  # <-- controlled by config.yml / CLI
         )
 
     # Step 3 — Decode only the newly generated tokens (strip the prompt)
@@ -179,6 +223,8 @@ def generate(req: GenerateRequest):
 def stats():
     return {
         "gpu_memory_mb": round(torch.cuda.memory_allocated() / 1024**2, 1),
+        "use_cache": args.use_cache,
+        "dtype": args.dtype,
     }
 
 
@@ -188,4 +234,4 @@ def stats():
 
 if __name__ == "__main__":
     logger.info(f"Starting Layer 0 server on {args.host}:{args.port}")
-    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+    uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)

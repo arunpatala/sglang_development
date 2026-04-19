@@ -31,29 +31,43 @@ from pathlib import Path
 from typing import List
 
 import requests
+import yaml
 from transformers import AutoTokenizer
 
 # ---------------------------------------------------------------------------
-# CLI
+# CLI  (mirrors server.py: config.yml sets defaults, CLI args override)
 # ---------------------------------------------------------------------------
 
-DEFAULT_MODEL = "Qwen/Qwen3-0.6B"
 SHAREGPT_REPO_ID = "anon8231489123/ShareGPT_Vicuna_unfiltered"
 SHAREGPT_FILENAME = "ShareGPT_V3_unfiltered_cleaned_split.json"
 
+_HERE = Path(__file__).parent
+
+
+def _load_config(path: str) -> dict:
+    p = Path(path)
+    if not p.exists():
+        return {}
+    with open(p) as f:
+        return yaml.safe_load(f) or {}
+
+
+_pre = argparse.ArgumentParser(add_help=False)
+_pre.add_argument("--config", default=str(_HERE / "config.yml"))
+_pre_args, _ = _pre.parse_known_args()
+
+cfg = _load_config(_pre_args.config)
+
 parser = argparse.ArgumentParser(description="Layer benchmark — throughput measurement")
-parser.add_argument("--host", default="localhost")
-parser.add_argument("--port", type=int, default=8100, help="Layer server port")
-parser.add_argument("--layer", type=int, default=0, help="Layer number (label only)")
-parser.add_argument("--num-requests", type=int, default=20, help="Number of ShareGPT conversations to sample")
-parser.add_argument("--max-new-tokens", type=int, default=128, help="Max tokens to generate per request (cap)")
-parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducible sampling")
-parser.add_argument("--model", default=DEFAULT_MODEL, help="Model path (for tokenizer only)")
-parser.add_argument(
-    "--dataset-path",
-    default="",
-    help="Local path to ShareGPT JSON. Leave empty to auto-download.",
-)
+parser.add_argument("--config", default=str(_HERE / "config.yml"), help="Path to YAML config file")
+parser.add_argument("--host",         default=cfg.get("host", "localhost"))
+parser.add_argument("--port",         default=cfg.get("port", 8100),                            type=int, help="Layer server port")
+parser.add_argument("--layer",        default=0,                                                 type=int, help="Layer number (label only)")
+parser.add_argument("--num-requests", default=cfg.get("benchmark_num_requests", 20),            type=int, help="Number of ShareGPT conversations to sample")
+parser.add_argument("--max-new-tokens", default=cfg.get("benchmark_max_new_tokens", 128),       type=int, help="Max tokens to generate per request (cap)")
+parser.add_argument("--seed",         default=cfg.get("benchmark_seed", 42),                    type=int, help="Random seed for reproducible sampling")
+parser.add_argument("--model",        default=cfg.get("model", "Qwen/Qwen3-0.6B"),              help="Model path (for tokenizer only)")
+parser.add_argument("--dataset-path", default="",                                               help="Local path to ShareGPT JSON. Leave empty to auto-download.")
 args = parser.parse_args()
 
 random.seed(args.seed)
