@@ -1,34 +1,34 @@
-# Layer 4B — Summary
+# Layer 5 — Summary
 
-Layer 4A took ownership of config reading and weight loading while keeping HuggingFace's Qwen3 as the forward computation. Layer 4B completes the picture: `self._model` — the HF `AutoModelForCausalLM` that did the actual computation — is replaced with our own `Qwen3Model`. The forward call returns a plain logits tensor, the KV cache is passed directly to our attention layers, and every step of the computation is now in code we can read and modify.
+Layer 4 took ownership of config reading and weight loading while keeping HuggingFace's Qwen3 as the forward computation. Layer 5 completes the picture: `self._model` — the HF `AutoModelForCausalLM` that did the actual computation — is replaced with our own `Qwen3Model`. The forward call returns a plain logits tensor, the KV cache is passed directly to our attention layers, and every step of the computation is now in code we can read and modify.
 
-The `from_pretrained`, `load_weights`, and `Qwen3Config` code from Layer 4A carries over to Layer 4B unchanged — loading is told once and done. The new code lives in five files: `norm.py`, `mlp.py`, `rope.py`, `attention.py`, and `decoder_layer.py`, composed into `Qwen3Model` and `Qwen3ForCausalLM` in `model/qwen3.py`.
+The `from_pretrained`, `load_weights`, and `Qwen3Config` code from Layer 4 carries over to Layer 5 unchanged — loading is told once and done. The new code lives in five files: `norm.py`, `mlp.py`, `rope.py`, `attention.py`, and `decoder_layer.py`, composed into `Qwen3Model` and `Qwen3ForCausalLM` in `model/qwen3.py`.
 
 ---
 
-## From Layer 4A to Layer 4B
+## From Layer 4 to Layer 5
 
-In Layer 4A, the forward call used HuggingFace's interface. `past_key_values` was the HF-compatible cache handle, and the call returned a `(logits, past_kv)` tuple whose second value was discarded because the `KVCache` updated itself in-place:
+In Layer 4, the forward call used HuggingFace's interface. `past_key_values` was the HF-compatible cache handle, and the call returned a `(logits, past_kv)` tuple whose second value was discarded because the `KVCache` updated itself in-place:
 
 ```python
-# Layer 4A — forward call
+# Layer 4 — forward call
 kv = KVCache()
 logits, _ = self.model(ids, attention_mask=mask,
                        past_key_values=kv, position_ids=pos)
 logits = logits[:, -1, :]
 ```
 
-In Layer 4B, our attention layers call `kv_cache.update(layer_idx, k, v)` directly. There is no HF adapter, no tuple to unpack — the call returns logits and nothing else:
+In Layer 5, our attention layers call `kv_cache.update(layer_idx, k, v)` directly. There is no HF adapter, no tuple to unpack — the call returns logits and nothing else:
 
 ```python
-# Layer 4B — forward call
+# Layer 5 — forward call
 kv = KVCache()
 logits = self.model(ids, attention_mask=mask,
                     kv_cache=kv, position_ids=pos)
 logits = logits[:, -1, :]
 ```
 
-That two-word change in the call signature — `past_key_values=kv` → `kv_cache=kv`, and unpacking `logits, _` → assigning `logits` — is the entire visible diff in `model_runner.py`. Everything else in `generate_batch` is unchanged from Layer 4A and Layer 3.
+That two-word change in the call signature — `past_key_values=kv` → `kv_cache=kv`, and unpacking `logits, _` → assigning `logits` — is the entire visible diff in `model_runner.py`. Everything else in `generate_batch` is unchanged from Layer 4 and Layer 3.
 
 Inside `Qwen3ForCausalLM.forward`, input IDs are embedded, RoPE rotation matrices are precomputed from position IDs, an additive causal-plus-padding mask is built, and the result is passed through 28 identical decoder layers before a final projection to vocabulary size. The sections below explain each of those steps in execution order.
 
@@ -100,7 +100,7 @@ The key property is that the dot product `Q_i · K_j` depends only on the relati
 
 ## The Additive Attention Mask
 
-In Layer 4A, a binary `attention_mask` was passed to HuggingFace, which built its internal additive mask in code we could not see. In Layer 4B, `_build_additive_mask` constructs it explicitly in one place and passes the result to every attention layer.
+In Layer 4, a binary `attention_mask` was passed to HuggingFace, which built its internal additive mask in code we could not see. In Layer 5, `_build_additive_mask` constructs it explicitly in one place and passes the result to every attention layer.
 
 The mask combines two parts. The causal part prevents any query token from attending to future key positions:
 
@@ -169,7 +169,7 @@ attn_out = F.scaled_dot_product_attention(
 
 ## The Full Loop
 
-Before any request arrives, `BatchedModel.__init__` loads the model. `Qwen3ForCausalLM.from_pretrained` handles path resolution, config reading, HF skeleton construction, weight streaming, and the `lm_head` tie — all covered in Layer 4A and unchanged here.
+Before any request arrives, `BatchedModel.__init__` loads the model. `Qwen3ForCausalLM.from_pretrained` handles path resolution, config reading, HF skeleton construction, weight streaming, and the `lm_head` tie — all covered in Layer 4 and unchanged here.
 
 A call arrives with B conversations. `tokenizer.prepare_batch` formats and left-pads them, returning `input_ids [B, max_prompt_len]`, `attention_mask`, and `prompt_lens_list`. The prefill position IDs are computed from `attention_mask` with the `cumsum` formula from Layer 3.
 
@@ -193,12 +193,12 @@ def forward(self, input_ids, attention_mask, kv_cache, position_ids):
 
 Four things happen before the layer loop: token IDs are embedded, the RoPE `(cos, sin)` pair is computed once from `position_ids`, the additive mask is built once, and `past_len` is read from the cache so the mask covers the correct `kv_len`. Each of the 28 `Qwen3DecoderLayer` blocks receives the same `cos`, `sin`, `additive_mask`, and `kv_cache` reference — no recomputation per layer. After all 28 layers, the final `RMSNorm` and `lm_head` produce `logits [B, max_prompt_len, vocab_size]`. The `[:, -1, :]` slice extracts last-position logits, `sample_batch` draws `next_tokens [B]`, and TTFT is recorded.
 
-The decode loop runs exactly as in Layer 4A and Layer 3. Finished requests receive `pad_id` via `torch.where`; the attention mask grows by one column of ones; per-request `decode_pos` is `prompt_lens + decode_step`. The same `Qwen3ForCausalLM.forward` is called with `current [B, 1]` — `q_len=1`, so the causal mask is all-zeros and the single query token attends to every key in the growing cache. The loop exits when `finished.all()` is true.
+The decode loop runs exactly as in Layer 4 and Layer 3. Finished requests receive `pad_id` via `torch.where`; the attention mask grows by one column of ones; per-request `decode_pos` is `prompt_lens + decode_step`. The same `Qwen3ForCausalLM.forward` is called with `current [B, 1]` — `q_len=1`, so the causal mask is all-zeros and the single query token attends to every key in the growing cache. The loop exits when `finished.all()` is true.
 
 ---
 
 ## What Comes Next
 
-Layer 4B does not change the scheduling primitive: `generate_batch` still holds the entire batch until the longest request finishes. Head-of-line blocking remains — a 5-token request is held until a co-batched 1000-token request completes.
+Layer 5 does not change the scheduling primitive: `generate_batch` still holds the entire batch until the longest request finishes. Head-of-line blocking remains — a 5-token request is held until a co-batched 1000-token request completes.
 
-Layer 5 (`layer5_continuous_batching`) addresses this by introducing a `Scheduler`, `Request`, and `Batch` object. Finished requests are evicted from the batch mid-loop; new requests enter with their own prefill injected at the next step. The `model/` package and `kv_cache.py` from Layer 4B are carried over unchanged — the architecture is not touched. The work moves into the scheduler that decides, at each step, which requests participate in the next forward pass and what shape the input tensor takes.
+Layer 6 (`layer6_continuous_batching`) addresses this by introducing a `Scheduler`, `Request`, and `Batch` object. Finished requests are evicted from the batch mid-loop; new requests enter with their own prefill injected at the next step. The `model/` package and `kv_cache.py` from Layer 5 are carried over unchanged — the architecture is not touched. The work moves into the scheduler that decides, at each step, which requests participate in the next forward pass and what shape the input tensor takes.

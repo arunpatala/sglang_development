@@ -1,6 +1,6 @@
 # 01 — The Decode Loop
 
-## From Layer 3 to Layer 4A
+## From Layer 3 to Layer 4
 
 In Layer 3, two lines in `model_runner.py` handed the entire architecture to HuggingFace:
 
@@ -24,10 +24,10 @@ past_kv = out.past_key_values   # re-assign every step
 logits  = out.logits[:, -1, :]
 ```
 
-In Layer 4A, the init becomes:
+In Layer 4, the init becomes:
 
 ```python
-# Layer 4A — model init
+# Layer 4 — model init
 from model import Qwen3ForCausalLM
 self.model = Qwen3ForCausalLM.from_pretrained(model_path, dtype=torch.bfloat16)
 ```
@@ -35,7 +35,7 @@ self.model = Qwen3ForCausalLM.from_pretrained(model_path, dtype=torch.bfloat16)
 The forward call returns `(logits, past_kv)` directly. `KVCache` — Layer 3's HF-compatible cache — is passed as `past_key_values`. HF's attention layers call `kv.update(key, value, layer_idx)` on it during the forward pass, updating it in-place. The returned second value is therefore redundant and can be discarded:
 
 ```python
-# Layer 4A — forward call
+# Layer 4 — forward call
 kv = KVCache()
 logits, _ = self.model(
     ids,

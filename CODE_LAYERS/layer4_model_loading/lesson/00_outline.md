@@ -1,10 +1,10 @@
-# Layer 4A — Lesson Outline
+# Layer 4 — Lesson Outline
 
 ## What This Lesson Covers
 
 Layer 3 called `AutoModelForCausalLM.from_pretrained` — HuggingFace resolved the path, parsed `config.json`, built the architecture, loaded the weights, and returned a `ModelOutput` object. We owned none of it.
 
-Layer 4A takes ownership of exactly two things: **reading the config** and **loading the weights**. Before either can happen, the model needs to be located: `_resolve_model_path` accepts either a local directory or a HuggingFace Hub model ID (`Qwen/Qwen3-0.6B`), calling `snapshot_download` to mirror the repository into `~/.cache/huggingface/hub/` when needed.
+Layer 4 takes ownership of exactly two things: **reading the config** and **loading the weights**. Before either can happen, the model needs to be located: `_resolve_model_path` accepts either a local directory or a HuggingFace Hub model ID (`Qwen/Qwen3-0.6B`), calling `snapshot_download` to mirror the repository into `~/.cache/huggingface/hub/` when needed.
 
 Config loading replaces HuggingFace's `PretrainedConfig` with `Qwen3Config`, a plain `@dataclass` with a `from_json()` classmethod. It reads only the numeric fields from `config.json`; the 13 other keys HuggingFace includes are silently ignored. An HF model skeleton is then built via `AutoModelForCausalLM.from_config` — architecture constructed, weights random, `tie_weights()` already called.
 
@@ -12,20 +12,20 @@ Weight loading streams tensors one at a time from `model.safetensors` using `saf
 
 The forward pass is still HuggingFace's Qwen3 implementation — `self._model` is an `AutoModelForCausalLM` under the hood. The change in `model_runner.py` is two lines at init time and the `logits, _ = self.model(...)` tuple unpack. Everything else — tokenizer, left-padding, position IDs, `KVCache`, finished mask, `sample_batch`, `server.py`, `benchmark.py` — is carried over from Layer 3 unchanged. The new code lives entirely in `model/config.py` and `model/qwen3.py`.
 
-Layer 4B takes the next step: replacing `self._model` with our own `Qwen3Model` (RMSNorm, RoPE, Attention, MLP, DecoderLayer) so we own the forward pass too.
+Layer 5 takes the next step: replacing `self._model` with our own `Qwen3Model` (RMSNorm, RoPE, Attention, MLP, DecoderLayer) so we own the forward pass too.
 
 Progression:
 - **Layer 3**  → HF loads + HF forward + HF `past_key_values`
-- **Layer 4A** → **we load** + HF forward + `KVCache` (HF-compatible)
-- **Layer 4B** → we load + **we forward** + our in-place `KVCache`
+- **Layer 4** → **we load** + HF forward + `KVCache` (HF-compatible)
+- **Layer 5** → we load + **we forward** + our in-place `KVCache`
 
 ---
 
 ## Sections
 
 ### 01 — The Model Runner (`01_the_decode_loop.md`)
-- Layer 3's `AutoModelForCausalLM.from_pretrained` vs Layer 4A's `Qwen3ForCausalLM.from_pretrained` — the two-line diff in `model_runner.py`
-- Layer 3 had `past_kv = out.past_key_values` re-assignment on every decode step; Layer 4A passes `KVCache()` (Layer 3's HF-compatible cache) as `past_key_values` — HF calls `kv.update()` in-place, no re-assign needed
+- Layer 3's `AutoModelForCausalLM.from_pretrained` vs Layer 4's `Qwen3ForCausalLM.from_pretrained` — the two-line diff in `model_runner.py`
+- Layer 3 had `past_kv = out.past_key_values` re-assignment on every decode step; Layer 4 passes `KVCache()` (Layer 3's HF-compatible cache) as `past_key_values` — HF calls `kv.update()` in-place, no re-assign needed
 - `logits, _ = self.model(...)` — forward returns `(logits, past_kv)` tuple; the second value is discarded because `kv` is already updated
 - Everything else in `generate_batch` — tokenizer, left-padding, cumsum position IDs, pad injection, mask extension, finished mask, `sample_batch` — is byte-for-byte identical to Layer 3
 - `verify.py` confirms numerical parity with HuggingFace outputs (trivially exact since we use the same HF forward); `verify_batch.py` checks B=4 batched vs 4×B=1 individual runs
@@ -35,7 +35,7 @@ Progression:
 - `_resolve_model_path`: local directory fast-path vs `snapshot_download`; cache layout (`~/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/<hash>/`); `HF_HUB_OFFLINE=1` for air-gapped clusters
 - `config.json` contents: the ~25 keys HuggingFace includes and the ~12 we extract
 - `Qwen3Config` as a plain `@dataclass` with `from_json()`: reads only the numeric fields; no `PretrainedConfig` inheritance, no hub-download machinery, no legacy compatibility shims; `d.get(key, default)` tolerates partial configs
-- `num_kv_groups` property: 16 Q heads ÷ 8 KV heads = 2; derived at runtime rather than stored to avoid redundancy; used explicitly in Layer 4B's `repeat_kv`
+- `num_kv_groups` property: 16 Q heads ÷ 8 KV heads = 2; derived at runtime rather than stored to avoid redundancy; used explicitly in Layer 5's `repeat_kv`
 - Building the HF model skeleton: `AutoConfig.from_pretrained` → `AutoModelForCausalLM.from_config` → `cls(config, hf_model)`; `from_config` calls `tie_weights()` internally before returning
 
 ### 03 — Weight Loading (`03_weight_loading.md`)
@@ -47,18 +47,18 @@ Progression:
 - Tied weights: HF's `from_config` already called `tie_weights()` — `lm_head.weight` and `embed_tokens.weight` share storage; the `continue` skips the redundant second copy of 310 MB from the checkpoint
 
 ### 04 — What Comes Next (`04_whats_next.md`)
-- Layer 4A owns loading but not the forward pass — `self._model` is still HF's `Qwen3ForCausalLM` under the hood
-- Layer 4B replaces `self._model` with our own `Qwen3Model`: RMSNorm, SwiGLU MLP, RotaryEmbedding, Qwen3Attention (GQA + per-head QK norm + SDPA), Qwen3DecoderLayer, and the additive causal-plus-padding mask
-- The `from_pretrained` / `load_weights` / `Qwen3Config` code in Layer 4A carries over to Layer 4B unchanged — the loading story is told once, here
-- `KVCache` in 4B switches from the HF-compatible interface (`update(key, value, layer_idx)`) to our own interface (`update(layer_idx, key, value)`) because our attention layers call it directly
-- Layer 5 (`layer5_continuous_batching`) adds a `Scheduler`, `Request`, and `Batch` object on top of 4B's model; the `model/` package and weight loading are not touched again
+- Layer 4 owns loading but not the forward pass — `self._model` is still HF's `Qwen3ForCausalLM` under the hood
+- Layer 5 replaces `self._model` with our own `Qwen3Model`: RMSNorm, SwiGLU MLP, RotaryEmbedding, Qwen3Attention (GQA + per-head QK norm + SDPA), Qwen3DecoderLayer, and the additive causal-plus-padding mask
+- The `from_pretrained` / `load_weights` / `Qwen3Config` code in Layer 4 carries over to Layer 5 unchanged — the loading story is told once, here
+- `KVCache` in 5 switches from the HF-compatible interface (`update(key, value, layer_idx)`) to our own interface (`update(layer_idx, key, value)`) because our attention layers call it directly
+- Layer 6 (`layer6_continuous_batching`) adds a `Scheduler`, `Request`, and `Batch` object on top of 5's model; the `model/` package and weight loading are not touched again
 
 ---
 
 ## Supporting Files
 
 - `summary.md` — prose overview of the config and weight loading concepts
-- `sglang_reference.md` — maps layer 4A concepts to SGLang source: `Qwen3Config` → `sglang/srt/models/qwen3.py` config handling; `load_weights()` iterator style → SGLang's `stacked_params_mapping`; `from_pretrained` → SGLang's `ModelRunner.load_model`
+- `sglang_reference.md` — maps layer 4 concepts to SGLang source: `Qwen3Config` → `sglang/srt/models/qwen3.py` config handling; `load_weights()` iterator style → SGLang's `stacked_params_mapping`; `from_pretrained` → SGLang's `ModelRunner.load_model`
 
 ---
 

@@ -1,15 +1,15 @@
 # 01 — The Decode Loop
 
-## From Layer 4A to Layer 4B
+## From Layer 4 to Layer 5
 
-Layer 4A owned config reading and weight loading but kept HuggingFace's `Qwen3ForCausalLM` as the actual computation. Its forward call used HF's `past_key_values` interface and returned a `(logits, past_kv)` tuple:
+Layer 4 owned config reading and weight loading but kept HuggingFace's `Qwen3ForCausalLM` as the actual computation. Its forward call used HF's `past_key_values` interface and returned a `(logits, past_kv)` tuple:
 
 ```python
-# Layer 4A — model init
+# Layer 4 — model init
 from model import Qwen3ForCausalLM
 self.model = Qwen3ForCausalLM.from_pretrained(model_path, dtype=torch.bfloat16)
 
-# Layer 4A — forward call
+# Layer 4 — forward call
 kv = KVCache()
 logits, _ = self.model(
     ids,
@@ -20,10 +20,10 @@ logits, _ = self.model(
 logits = logits[:, -1, :]   # _ discarded; kv already updated in-place via HF protocol
 ```
 
-In Layer 4B, `self._model` is replaced with our own `Qwen3Model`. Our attention layers call `kv_cache.update(layer_idx, k, v)` directly — no HF adapter — and the forward returns a plain logits tensor with nothing to unpack:
+In Layer 5, `self._model` is replaced with our own `Qwen3Model`. Our attention layers call `kv_cache.update(layer_idx, k, v)` directly — no HF adapter — and the forward returns a plain logits tensor with nothing to unpack:
 
 ```python
-# Layer 4B — forward call (init line is identical)
+# Layer 5 — forward call (init line is identical)
 kv = KVCache()
 logits = self.model(
     ids,
@@ -34,13 +34,13 @@ logits = self.model(
 logits = logits[:, -1, :]   # kv updated in-place by our attention layers directly
 ```
 
-The visible diff in `model_runner.py` is two words: `past_key_values=kv` → `kv_cache=kv`, and `logits, _ =` → `logits =`. Everything else — the tokenizer call, the prefill position IDs, the pad injection, the attention mask extension, the decode position IDs, the finished mask, `sample_batch` — is byte-for-byte identical to Layer 4A and Layer 3. The rest of this section explains the new `model/` package that makes this possible.
+The visible diff in `model_runner.py` is two words: `past_key_values=kv` → `kv_cache=kv`, and `logits, _ =` → `logits =`. Everything else — the tokenizer call, the prefill position IDs, the pad injection, the attention mask extension, the decode position IDs, the finished mask, `sample_batch` — is byte-for-byte identical to Layer 4 and Layer 3. The rest of this section explains the new `model/` package that makes this possible.
 
 ---
 
 ## The Complete `BatchedModel.generate_batch`
 
-The full `generate_batch` from `model_runner.py`, unabridged, shows the same scheduling logic from Layers 3 and 4A running against our new model:
+The full `generate_batch` from `model_runner.py`, unabridged, shows the same scheduling logic from Layers 3 and 4 running against our new model:
 
 ```python
 def generate_batch(
@@ -168,7 +168,7 @@ logits = self.model(input_ids, attention_mask=attention_mask,
 ttft_ms = round((time.perf_counter() - t_prefill) * 1000, 1)
 ```
 
-One forward pass processes all B prompts simultaneously. `prefill_pos` corrects the RoPE encoding that would otherwise be wrong for left-padded sequences — the same `cumsum` fix carried from Layer 3. The difference from Layer 4A is the call signature: `kv_cache=kv` instead of `past_key_values=kv`, and the return is a plain `logits` tensor rather than a `(logits, past_kv)` tuple. Each of the 28 attention layers inside our `Qwen3ForCausalLM` calls `kv.update(layer_idx, k, v)` during this pass, populating the cache in-place. TTFT is recorded immediately after this call.
+One forward pass processes all B prompts simultaneously. `prefill_pos` corrects the RoPE encoding that would otherwise be wrong for left-padded sequences — the same `cumsum` fix carried from Layer 3. The difference from Layer 4 is the call signature: `kv_cache=kv` instead of `past_key_values=kv`, and the return is a plain `logits` tensor rather than a `(logits, past_kv)` tuple. Each of the 28 attention layers inside our `Qwen3ForCausalLM` calls `kv.update(layer_idx, k, v)` during this pass, populating the cache in-place. TTFT is recorded immediately after this call.
 
 ### Step 3 — Sample First Tokens
 
@@ -188,7 +188,7 @@ On every step, finished requests have their token replaced with `pad_id` via `to
 texts = self.tokenizer.decode_batch(generated)
 ```
 
-`generated` is a list of B lists of token IDs accumulated during the decode loop, excluding any tokens produced after EOS. `decode_batch` converts each list to a string. TPOT is the average of `step_times`, which measures only decode forward passes — prefill cost is captured separately in TTFT. The result dict schema is identical to Layers 3 and 4A, so `server.py` handles it without modification.
+`generated` is a list of B lists of token IDs accumulated during the decode loop, excluding any tokens produced after EOS. `decode_batch` converts each list to a string. TPOT is the average of `step_times`, which measures only decode forward passes — prefill cost is captured separately in TTFT. The result dict schema is identical to Layers 3 and 4, so `server.py` handles it without modification.
 
 ---
 

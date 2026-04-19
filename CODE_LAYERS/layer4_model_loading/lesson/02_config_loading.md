@@ -159,13 +159,13 @@ def num_kv_groups(self) -> int:
     return self.num_attention_heads // self.num_key_value_heads   # 16 // 8 = 2
 ```
 
-In Layer 4A this value is not used directly by our code — HF reads the GQA ratio from its own config object. In Layer 4B, our `Qwen3Attention` implementation will use `num_kv_groups` explicitly to expand the KV heads via `repeat_kv` before computing attention scores. It is declared as a property rather than a stored field because it is entirely determined by the two head counts — having both the raw values and the derived ratio stored separately would risk them going out of sync.
+In Layer 4 this value is not used directly by our code — HF reads the GQA ratio from its own config object. In Layer 5, our `Qwen3Attention` implementation will use `num_kv_groups` explicitly to expand the KV heads via `repeat_kv` before computing attention scores. It is declared as a property rather than a stored field because it is entirely determined by the two head counts — having both the raw values and the derived ratio stored separately would risk them going out of sync.
 
 ---
 
 ## Building the HF Model Skeleton
 
-With `config` in hand, `from_pretrained` needs to construct the neural network before any weights can be copied into it. In Layer 4A, the forward computation is still HuggingFace's — so the skeleton must be an HF model:
+With `config` in hand, `from_pretrained` needs to construct the neural network before any weights can be copied into it. In Layer 4, the forward computation is still HuggingFace's — so the skeleton must be an HF model:
 
 ```python
 from transformers import AutoConfig, AutoModelForCausalLM
@@ -175,7 +175,7 @@ hf_model  = AutoModelForCausalLM.from_config(hf_config) # architecture, random w
 model     = cls(config, hf_model)                       # our wrapper
 ```
 
-`AutoConfig.from_pretrained(model_dir)` reads `config.json` a second time — into HF's own `PretrainedConfig` object. This is needed because `AutoModelForCausalLM.from_config` expects a `PretrainedConfig`, not our dataclass. The two config objects co-exist: HF's is used to build the architecture; ours is used for everything we control (tied weights check, dtype handling, and later GQA ratios in Layer 4B).
+`AutoConfig.from_pretrained(model_dir)` reads `config.json` a second time — into HF's own `PretrainedConfig` object. This is needed because `AutoModelForCausalLM.from_config` expects a `PretrainedConfig`, not our dataclass. The two config objects co-exist: HF's is used to build the architecture; ours is used for everything we control (tied weights check, dtype handling, and later GQA ratios in Layer 5).
 
 `AutoModelForCausalLM.from_config` constructs the full `Qwen3ForCausalLM` architecture — all 28 decoder layers with their attention, MLP, and norm modules — initialised with random weights from `nn.init`. No checkpoint is loaded; this is a skeleton. Crucially, `from_config` calls `tie_weights()` internally, which makes `lm_head.weight` and `embed_tokens.weight` point to the same storage before any real weights are written. This is important for the loading step covered in section 03.
 

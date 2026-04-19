@@ -1,10 +1,10 @@
-# Layer 4A — Summary
+# Layer 4 — Summary
 
-Layer 4A takes ownership of two things that HuggingFace previously handled invisibly: **reading the config** and **loading the weights**. The forward computation is still HuggingFace's — `self._model` is an `AutoModelForCausalLM` under the hood. Layer 4B replaces it with our own layers. The value of doing loading first, separately, is that `from_pretrained`, `load_weights`, and `Qwen3Config` are explained once here and carried forward unchanged into every subsequent layer.
+Layer 4 takes ownership of two things that HuggingFace previously handled invisibly: **reading the config** and **loading the weights**. The forward computation is still HuggingFace's — `self._model` is an `AutoModelForCausalLM` under the hood. Layer 5 replaces it with our own layers. The value of doing loading first, separately, is that `from_pretrained`, `load_weights`, and `Qwen3Config` are explained once here and carried forward unchanged into every subsequent layer.
 
 ---
 
-## From Layer 3 to Layer 4A
+## From Layer 3 to Layer 4
 
 In Layer 3, two lines handed everything to HuggingFace:
 
@@ -24,10 +24,10 @@ past_kv = out.past_key_values   # re-assign every step
 logits  = out.logits[:, -1, :]
 ```
 
-In Layer 4A, the init becomes:
+In Layer 4, the init becomes:
 
 ```python
-# Layer 4A
+# Layer 4
 from model import Qwen3ForCausalLM
 self.model = Qwen3ForCausalLM.from_pretrained(model_path, dtype=torch.bfloat16)
 ```
@@ -35,7 +35,7 @@ self.model = Qwen3ForCausalLM.from_pretrained(model_path, dtype=torch.bfloat16)
 The forward call returns `(logits, past_kv)` directly. `KVCache` — Layer 3's HF-compatible cache — is passed as `past_key_values` and updated in-place by HF's attention layers, so the returned second value can be discarded:
 
 ```python
-# Layer 4A — forward call
+# Layer 4 — forward call
 kv = KVCache()
 logits, _ = self.model(ids, attention_mask=mask,
                        past_key_values=kv, position_ids=pos)
@@ -92,7 +92,7 @@ class Qwen3Config:
         return self.num_attention_heads // self.num_key_value_heads   # 16 // 8 = 2
 ```
 
-HuggingFace's `PretrainedConfig` adds roughly a thousand lines of serialisation, hub-download, and legacy-compatibility machinery. All we need are the numeric hyperparameters, so a dataclass suffices. `from_json` uses `d.get(key, default)` for every field — unknown keys in the JSON are silently ignored, and a partial config (useful in unit tests) populates with sensible defaults. `num_kv_groups` is a derived property rather than a stored field to prevent the two head counts from going out of sync. In Layer 4B it will be used explicitly to expand KV heads via `repeat_kv`.
+HuggingFace's `PretrainedConfig` adds roughly a thousand lines of serialisation, hub-download, and legacy-compatibility machinery. All we need are the numeric hyperparameters, so a dataclass suffices. `from_json` uses `d.get(key, default)` for every field — unknown keys in the JSON are silently ignored, and a partial config (useful in unit tests) populates with sensible defaults. `num_kv_groups` is a derived property rather than a stored field to prevent the two head counts from going out of sync. In Layer 5 it will be used explicitly to expand KV heads via `repeat_kv`.
 
 ---
 
@@ -166,6 +166,6 @@ The `lm_head.weight` key is skipped because `from_config` already called `tie_we
 
 ## What Comes Next
 
-Layer 4A owns loading but not the forward pass. `self._model` inside `Qwen3ForCausalLM` is still HF's implementation — 28 layers of RMSNorm, RoPE, Attention, MLP, and the causal mask that HF builds internally.
+Layer 4 owns loading but not the forward pass. `self._model` inside `Qwen3ForCausalLM` is still HF's implementation — 28 layers of RMSNorm, RoPE, Attention, MLP, and the causal mask that HF builds internally.
 
-Layer 4B replaces `self._model` with our own `Qwen3Model`. The `from_pretrained`, `load_weights`, and `Qwen3Config` code from Layer 4A carries over unchanged — the loading story is told once and done. The new work in 4B is the forward computation: `RMSNorm`, `RotaryEmbedding`, `Qwen3Attention` (GQA + per-head QK norm + SDPA), `Qwen3MLP` (SwiGLU), `Qwen3DecoderLayer`, and the explicit `_build_additive_mask`. The `KVCache` interface also shifts from HF's signature (`update(key, value, layer_idx)`) to our own (`update(layer_idx, key, value)`) so our attention layers can call it directly.
+Layer 5 replaces `self._model` with our own `Qwen3Model`. The `from_pretrained`, `load_weights`, and `Qwen3Config` code from Layer 4 carries over unchanged — the loading story is told once and done. The new work in 5 is the forward computation: `RMSNorm`, `RotaryEmbedding`, `Qwen3Attention` (GQA + per-head QK norm + SDPA), `Qwen3MLP` (SwiGLU), `Qwen3DecoderLayer`, and the explicit `_build_additive_mask`. The `KVCache` interface also shifts from HF's signature (`update(key, value, layer_idx)`) to our own (`update(layer_idx, key, value)`) so our attention layers can call it directly.

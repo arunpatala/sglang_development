@@ -1,37 +1,37 @@
-# Layer 4B — Lesson Outline
+# Layer 5 — Lesson Outline
 
 ## What This Lesson Covers
 
-Layer 4A took ownership of config reading and weight loading, but kept HuggingFace's Qwen3 as the forward computation: `self._model` was an `AutoModelForCausalLM` under the hood, and the generate loop used `past_key_values=kv` with the HF-compatible `KVCache`.
+Layer 4 took ownership of config reading and weight loading, but kept HuggingFace's Qwen3 as the forward computation: `self._model` was an `AutoModelForCausalLM` under the hood, and the generate loop used `past_key_values=kv` with the HF-compatible `KVCache`.
 
-Layer 4B replaces `self._model` with our own `Qwen3Model`. Five files implement the Qwen3 architecture from scratch: `norm.py` (`RMSNorm`), `mlp.py` (`Qwen3MLP` with SwiGLU), `rope.py` (`RotaryEmbedding` and `apply_rotary_pos_emb`), `attention.py` (`Qwen3Attention` with GQA and per-head QK norm), and `decoder_layer.py` (`Qwen3DecoderLayer`). These are composed into `Qwen3Model` and the outer `Qwen3ForCausalLM` in `model/qwen3.py`.
+Layer 5 replaces `self._model` with our own `Qwen3Model`. Five files implement the Qwen3 architecture from scratch: `norm.py` (`RMSNorm`), `mlp.py` (`Qwen3MLP` with SwiGLU), `rope.py` (`RotaryEmbedding` and `apply_rotary_pos_emb`), `attention.py` (`Qwen3Attention` with GQA and per-head QK norm), and `decoder_layer.py` (`Qwen3DecoderLayer`). These are composed into `Qwen3Model` and the outer `Qwen3ForCausalLM` in `model/qwen3.py`.
 
-The forward call interface also changes. In Layer 4A, `self.model` returned `(logits, past_kv)` and the KV cache was passed as `past_key_values` via HF's interface. In Layer 4B, `self.model` returns logits directly and the cache is passed as `kv_cache`. Our attention layers call `kv_cache.update(layer_idx, k, v)` directly — no HF adapter needed:
+The forward call interface also changes. In Layer 4, `self.model` returned `(logits, past_kv)` and the KV cache was passed as `past_key_values` via HF's interface. In Layer 5, `self.model` returns logits directly and the cache is passed as `kv_cache`. Our attention layers call `kv_cache.update(layer_idx, k, v)` directly — no HF adapter needed:
 
 ```
-# 4A
+# 4
 logits, _ = self.model(ids, past_key_values=kv, ...)
 
-# 4B
+# 5
 logits = self.model(ids, kv_cache=kv, ...)
 ```
 
-The `from_pretrained`, `load_weights`, and `Qwen3Config` code from Layer 4A carries over to Layer 4B unchanged — the loading story is told once. The change in `model_runner.py` is the forward call signature. Everything else — tokenizer, left-padding, position IDs, finished mask, `sample_batch`, `server.py`, `benchmark.py` — is carried over unchanged.
+The `from_pretrained`, `load_weights`, and `Qwen3Config` code from Layer 4 carries over to Layer 5 unchanged — the loading story is told once. The change in `model_runner.py` is the forward call signature. Everything else — tokenizer, left-padding, position IDs, finished mask, `sample_batch`, `server.py`, `benchmark.py` — is carried over unchanged.
 
 Progression:
 - **Layer 3**  → HF loads + HF forward + HF `past_key_values`
-- **Layer 4A** → we load + HF forward + `KVCache` (HF-compatible)
-- **Layer 4B** → we load + **we forward** + our in-place `KVCache`
+- **Layer 4** → we load + HF forward + `KVCache` (HF-compatible)
+- **Layer 5** → we load + **we forward** + our in-place `KVCache`
 
 ---
 
 ## Sections
 
 ### 01 — The Model Runner (`01_the_decode_loop.md`)
-- Layer 4A's `logits, _ = self.model(..., past_key_values=kv, ...)` vs Layer 4B's `logits = self.model(..., kv_cache=kv, ...)` — the two-line diff in `model_runner.py`
+- Layer 4's `logits, _ = self.model(..., past_key_values=kv, ...)` vs Layer 5's `logits = self.model(..., kv_cache=kv, ...)` — the two-line diff in `model_runner.py`
 - Why the interface changes: our attention layers call `kv_cache.update(layer_idx, k, v)` directly rather than through HF's `DynamicCache` protocol
 - `verify.py` and `verify_batch.py` confirm numerical parity with HuggingFace outputs within bfloat16 tolerance
-- Everything else in `generate_batch` is byte-for-byte identical to Layer 4A and Layer 3
+- Everything else in `generate_batch` is byte-for-byte identical to Layer 4 and Layer 3
 
 ### 02 — RMSNorm and the Decoder Layer (`03_rmsnorm_and_decoder_layer.md`)
 - `RMSNorm.forward`: cast to `float32`, compute `rsqrt(mean(x²) + eps)`, multiply learned `weight`, cast back — why float32 is needed for numerical stability at bfloat16 training precision
@@ -49,7 +49,7 @@ Progression:
 - RoPE is computed once per forward pass in `Qwen3Model.forward` and the same `(cos, sin)` pair is passed to all 28 decoder layers — no per-layer recomputation
 
 ### 04 — The Additive Attention Mask (`05_additive_mask.md`)
-- Layer 4A passed a binary `attention_mask` to HuggingFace, which built its own additive mask internally; Layer 4B builds it explicitly in `_build_additive_mask` and passes the result to every layer
+- Layer 4 passed a binary `attention_mask` to HuggingFace, which built its own additive mask internally; Layer 5 builds it explicitly in `_build_additive_mask` and passes the result to every layer
 - Causal part: `torch.zeros(q_len, kv_len)` then `masked_fill(triu(diagonal=kv_len−q_len+1), −inf)` — the diagonal offset aligns future positions correctly with the cached past
 - Decode case (`q_len=1`): `triu(diagonal=kv_len)` selects nothing, so the causal tensor remains all-zeros — the single query token can attend to every cached key
 - Padding part: `(1.0 − attention_mask.float()) * NEG_INF` → shape `[B, 1, 1, kv_len]` — zeros where tokens are real, `−inf` where they are padding
@@ -66,16 +66,16 @@ Progression:
 
 ### 06 — The Full Loop (`07_the_full_loop.md`)
 - End-to-end trace of one `generate_batch` call, connecting all prior sections in execution order
-- Step 1 — Tokenise (identical to Layers 3 and 4A): `prepare_batch` → `input_ids`, `attention_mask`, `prompt_lens`
+- Step 1 — Tokenise (identical to Layers 3 and 4): `prepare_batch` → `input_ids`, `attention_mask`, `prompt_lens`
 - Step 2 — Prefill: `prefill_pos` from `cumsum`; `KVCache()` created; `Qwen3ForCausalLM.forward` → `Qwen3Model.forward` → embed → RoPE (section 03) → additive mask (section 04) → 28 × `Qwen3DecoderLayer` (section 02) each calling `Qwen3Attention` (section 05) → `kv_cache.update()` → final `RMSNorm` → `lm_head`; `sample_batch` → `next_tokens [B]`; TTFT recorded
 - Step 3 — Decode loop: pad injection, mask extension, per-request `decode_pos`, same `Qwen3ForCausalLM.forward` with `q_len=1` (causal mask all-zeros), `sample_batch`, `finished |=`, `finished.all()` exit
 - Step 4 — Results: `decode_batch` → texts; per-request dict assembled with `latency_ms`, `ttft_ms`, `tpot_ms`
 
 ### 07 — What Comes Next (`08_whats_next.md`)
-- Layer 4B's `generate_batch` still holds the entire batch until the longest request finishes — head-of-line blocking from Layer 3 is unchanged
-- Layer 5 (`layer5_continuous_batching`) adds a `Scheduler`, `Request`, and `Batch` object: finished requests are evicted mid-loop and new requests inserted in their place, so no request waits for another
+- Layer 5's `generate_batch` still holds the entire batch until the longest request finishes — head-of-line blocking from Layer 3 is unchanged
+- Layer 6 (`layer6_continuous_batching`) adds a `Scheduler`, `Request`, and `Batch` object: finished requests are evicted mid-loop and new requests inserted in their place, so no request waits for another
 - What files change: `scheduler.py`, `batch.py`, `request.py`; the `generate_batch` loop in `model_runner.py` is replaced by a `step()` method that the scheduler drives
-- What stays the same: the `model/` package and `kv_cache.py` are carried over from Layer 4B unchanged — the architecture and weight loading are not touched
+- What stays the same: the `model/` package and `kv_cache.py` are carried over from Layer 5 unchanged — the architecture and weight loading are not touched
 - The key engineering challenge Layer 5 addresses: a newly inserted mid-flight request needs its prefill mixed with ongoing decode steps in the same forward pass
 
 ---
@@ -83,7 +83,7 @@ Progression:
 ## Supporting Files
 
 - `summary.md` — blog-post-style summary covering all sections
-- `sglang_reference.md` — maps Layer 4B concepts to SGLang source: `repeat_kv` → `QKVParallelLinear`; `_build_additive_mask` → SGLang's `InputMetadata` + `RadixAttention`; per-head QK norm → SGLang's `Qwen3Attention`; `KVCache.update` → SGLang's paged KV cache
+- `sglang_reference.md` — maps Layer 5 concepts to SGLang source: `repeat_kv` → `QKVParallelLinear`; `_build_additive_mask` → SGLang's `InputMetadata` + `RadixAttention`; per-head QK norm → SGLang's `Qwen3Attention`; `KVCache.update` → SGLang's paged KV cache
 
 ---
 

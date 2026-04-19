@@ -12,7 +12,7 @@ Before any request arrives, `BatchedModel.__init__` calls:
 self.model = Qwen3ForCausalLM.from_pretrained(model_path, dtype=torch.bfloat16)
 ```
 
-`from_pretrained` resolves the model path, reads `config.json` into our `Qwen3Config` dataclass, builds the full architecture on CPU, casts to `bfloat16`, and streams weights from `model.safetensors` one tensor at a time into each parameter. The `lm_head` and `embed_tokens` weights share memory via the tie. These steps are covered in Layer 4A; they carry over to Layer 4B unchanged. Every subsequent forward call goes through code we own.
+`from_pretrained` resolves the model path, reads `config.json` into our `Qwen3Config` dataclass, builds the full architecture on CPU, casts to `bfloat16`, and streams weights from `model.safetensors` one tensor at a time into each parameter. The `lm_head` and `embed_tokens` weights share memory via the tie. These steps are covered in Layer 4; they carry over to Layer 5 unchanged. Every subsequent forward call goes through code we own.
 
 ---
 
