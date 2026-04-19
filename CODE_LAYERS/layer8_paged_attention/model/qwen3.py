@@ -83,91 +83,31 @@ class Qwen3Model(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,                       # [B, q_len]
-        attention_mask: torch.Tensor | None,           # [B, kv_len] binary (1=real, 0=pad)
-        kv_cache=None,                                 # KVCache | None
-        position_ids: torch.Tensor | None = None,      # [B, q_len] explicit positions
+        input_ids:    torch.Tensor,                 # [B, q_len]
+        forward_batch=None,                         # ForwardBatch | None
+        position_ids: torch.Tensor | None = None,   # [B, q_len] explicit positions
     ) -> torch.Tensor:
         B, q_len = input_ids.shape
-        past_len = kv_cache.get_seq_length() if kv_cache is not None else 0
 
         # ── Token embeddings ──────────────────────────────────────────────
         hidden = self.embed_tokens(input_ids)  # [B, q_len, hidden]
 
         # ── Position IDs and RoPE ─────────────────────────────────────────
-        # With left-padding, real tokens in shorter prompts are shifted right
-        # by `padding_amount` positions.  Without per-example position_ids,
-        # every batch element gets the same sequential [0..q_len-1] range, so
-        # real tokens in padded sequences get wrong RoPE positions.
-        # The caller should supply position_ids computed from attention_mask;
-        # we fall back to sequential positions only for B=1 (no padding).
+        # The caller always supplies position_ids (model_runner computes them
+        # per-request). The fallback is only for standalone testing (B=1).
         if position_ids is None:
             position_ids = torch.arange(
-                past_len, past_len + q_len, device=input_ids.device
-            ).unsqueeze(0).expand(B, -1)                # [B, q_len]
-        cos, sin = self.rotary_emb(hidden, position_ids) # each [B, q_len, head_dim]
-
-        # ── Build additive attention mask ─────────────────────────────────
-        # Combines causal masking (future positions → -inf) with padding
-        # masking (pad positions → -inf).  Computed once, shared by all layers.
-        additive_mask = _build_additive_mask(
-            attention_mask=attention_mask,
-            q_len=q_len,
-            kv_len=past_len + q_len,
-            dtype=hidden.dtype,
-            device=hidden.device,
-        )
+                q_len, device=input_ids.device
+            ).unsqueeze(0).expand(B, -1)                 # [B, q_len]
+        cos, sin = self.rotary_emb(hidden, position_ids)  # each [B, q_len, head_dim]
 
         # ── 28 × Decoder layers ───────────────────────────────────────────
+        # Mask construction and KV pool access are delegated to the backend
+        # inside each attention layer (via forward_batch).
         for layer in self.layers:
-            hidden = layer(hidden, cos, sin, additive_mask, kv_cache)
+            hidden = layer(hidden, cos, sin, forward_batch)
 
         return self.norm(hidden)  # [B, q_len, hidden]
-
-
-def _build_additive_mask(
-    attention_mask: torch.Tensor | None,
-    q_len: int,
-    kv_len: int,
-    dtype: torch.dtype,
-    device: torch.device,
-) -> torch.Tensor | None:
-    """
-    Build a [B, 1, q_len, kv_len] additive mask:
-      0     → position is attended to
-      -inf  → position is masked (future token or padding)
-
-    For q_len == 1 (decode step): the causal part is all-zero because a
-    single query token can attend to every key in the cache.
-    """
-    NEG_INF = torch.finfo(dtype).min
-
-    # ── Causal mask ───────────────────────────────────────────────────────
-    # Upper-triangular positions are in the future → -inf.
-    # For q_len=1, triu(diagonal=kv_len) is empty, so causal is all zeros.
-    causal = torch.zeros(q_len, kv_len, dtype=dtype, device=device)
-    if q_len > 1:
-        # diagonal = kv_len - q_len + 1 so that position i can attend to
-        # positions 0..past_len+i (causal within the new tokens).
-        mask_upper = torch.ones(q_len, kv_len, dtype=torch.bool, device=device)
-        mask_upper = torch.triu(mask_upper, diagonal=kv_len - q_len + 1)
-        causal = causal.masked_fill(mask_upper, NEG_INF)
-
-    # [1, 1, q_len, kv_len] — broadcasts over batch and heads
-    causal = causal.unsqueeze(0).unsqueeze(0)
-
-    if attention_mask is None:
-        return causal
-
-    # ── Padding mask ──────────────────────────────────────────────────────
-    # attention_mask: [B, kv_len] binary (1=real, 0=pad)
-    # We need it to cover exactly kv_len columns.  During prefill kv_len ==
-    # prompt_len; during decode the caller extends it by 1 each step.
-    pad = attention_mask.to(dtype)                # 1.0 or 0.0
-    pad = (1.0 - pad) * NEG_INF                  # 0.0 or -inf
-    pad = pad[:, None, None, :]                   # [B, 1, 1, kv_len]
-
-    return causal + pad                           # [B, 1, q_len, kv_len]
 
 
 # ---------------------------------------------------------------------------
@@ -192,12 +132,11 @@ class Qwen3ForCausalLM(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,                      # [B, q_len]
-        attention_mask: torch.Tensor | None = None,   # [B, kv_len]
-        kv_cache=None,                                # KVCache | None
-        position_ids: torch.Tensor | None = None,     # [B, q_len]
-    ) -> torch.Tensor:                                # [B, q_len, vocab_size]
-        hidden = self.model(input_ids, attention_mask, kv_cache, position_ids)
+        input_ids:    torch.Tensor,                 # [B, q_len]
+        forward_batch=None,                         # ForwardBatch | None
+        position_ids: torch.Tensor | None = None,   # [B, q_len]
+    ) -> torch.Tensor:                              # [B, q_len, vocab_size]
+        hidden = self.model(input_ids, forward_batch, position_ids)
         return self.lm_head(hidden)
 
     # ------------------------------------------------------------------ #

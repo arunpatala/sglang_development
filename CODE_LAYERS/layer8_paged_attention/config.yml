@@ -1,0 +1,54 @@
+# Layer 8 — Paged Attention Configuration
+# -----------------------------------------
+# Mirrors sglang's --config pattern (server_args_config_parser.py):
+#   CLI args  >  this file  >  Python hardcoded defaults
+#
+# Usage:
+#   python server.py                        # loads this file automatically
+#   python server.py --port 8200            # overrides just the port; rest from here
+#   python server.py --kv-memory-fraction 0.7   # smaller KV pool for debugging
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+model: Qwen/Qwen3-0.6B
+dtype: bfloat16     # weight dtype loaded onto the GPU (bfloat16 halves memory vs float32)
+device: cuda
+
+# ---------------------------------------------------------------------------
+# Server
+# ---------------------------------------------------------------------------
+host: "0.0.0.0"
+port: 8107
+log_level: warning  # uvicorn access-log verbosity
+
+# ---------------------------------------------------------------------------
+# Scheduler
+# ---------------------------------------------------------------------------
+max_running: 16   # max requests in the decode batch simultaneously
+
+# ---------------------------------------------------------------------------
+# KV pool
+# Paged attention pre-allocates a flat KV pool sized from free GPU memory.
+# kv_memory_fraction: fraction of free memory (after model load) used for pool.
+# Higher = more concurrent tokens; lower = leaves headroom for other tensors.
+# ---------------------------------------------------------------------------
+kv_memory_fraction: 0.85
+
+# ---------------------------------------------------------------------------
+# Generation behaviour
+# Layer 8 replaces PerReqKVCache / PackedKVCache with a paged KV pool.
+# K and V for every layer are stored in a single flat pool tensor; each token
+# occupies one slot (page_size=1). FlashInfer reads history directly from the
+# pool via a kv_indices array — no per-step gather copy.
+# ---------------------------------------------------------------------------
+max_new_tokens: 128  # default when the request does not specify
+temperature: 1.0
+
+# ---------------------------------------------------------------------------
+# Benchmark (benchmark.py)
+# ---------------------------------------------------------------------------
+benchmark_num_requests: 20
+benchmark_max_new_tokens: 128
+benchmark_seed: 42
+benchmark_batch_sizes: [1, 4, 8, 16, 20]

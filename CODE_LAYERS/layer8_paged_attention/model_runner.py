@@ -41,6 +41,7 @@ import flashinfer
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+from forward_batch import ForwardBatch, ForwardMode
 from kv_cache import DecodeKVCtx, KVPool, PrefillKVCtx
 from model import Qwen3ForCausalLM
 from request import Req, ReqStatus
@@ -59,8 +60,15 @@ _WORKSPACE_MB = 256
 
 class ModelRunner:
 
-    def __init__(self, model_path: str) -> None:
-        logger.info(f"ModelRunner: loading model from {model_path}")
+    def __init__(
+        self,
+        model_path:          str,
+        kv_memory_fraction:  float = _KV_MEMORY_FRACTION,
+    ) -> None:
+        logger.info(
+            f"ModelRunner: loading model from {model_path}  "
+            f"kv_memory_fraction={kv_memory_fraction}"
+        )
         t0 = time.perf_counter()
 
         self.tokenizer = Tokenizer(model_path)
@@ -78,7 +86,7 @@ class ModelRunner:
             * cfg.head_dim
             * (torch.finfo(DTYPE).bits // 8)
         )
-        max_tokens = int(free_bytes * _KV_MEMORY_FRACTION / bytes_per_token)
+        max_tokens = int(free_bytes * kv_memory_fraction / bytes_per_token)
 
         self.kv_pool = KVPool(
             total_slots = max_tokens,
@@ -132,8 +140,9 @@ class ModelRunner:
         pos  = torch.arange(prompt_len, device=DEVICE).unsqueeze(0)  # [1, L]
 
         ctx = PrefillKVCtx(slots, self.kv_pool)
+        fb  = ForwardBatch(mode=ForwardMode.PREFILL, kv_cache=ctx, attention_mask=mask)
         with torch.no_grad():
-            logits = self.model(ids, attention_mask=mask, kv_cache=ctx, position_ids=pos)
+            logits = self.model(ids, forward_batch=fb, position_ids=pos)
 
         req.t_first_token = time.perf_counter()
 
@@ -235,15 +244,12 @@ class ModelRunner:
             v_pool    = self.kv_pool.v_pool,
             new_slots = new_slots_t,
         )
+        fb = ForwardBatch(mode=ForwardMode.DECODE, kv_cache=ctx, attention_mask=None)
 
         # ── Batched forward ────────────────────────────────────────────
         with torch.no_grad():
-            logits = self.model(
-                last_toks,
-                attention_mask = None,   # FlashInfer uses kv_indices, not a mask
-                kv_cache       = ctx,
-                position_ids   = pos_ids,
-            )   # [B, 1, vocab]
+            logits = self.model(last_toks, forward_batch=fb, position_ids=pos_ids)
+        # [B, 1, vocab]
 
         decode_wrapper.end_forward()
 

@@ -39,6 +39,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+from forward_batch import ForwardBatch, ForwardMode
 from kv_cache import DecodeKVCtx, KVPool, PrefillKVCtx
 from model import Qwen3ForCausalLM
 from tokenizer import Tokenizer
@@ -114,9 +115,10 @@ def run_lockstep(model, tok, n_steps: int):
 
         slots = kv_pool.alloc(len(ids))
         ctx   = PrefillKVCtx(slots, kv_pool)
+        fb    = ForwardBatch(mode=ForwardMode.PREFILL, kv_cache=ctx, attention_mask=mask)
 
         with torch.no_grad():
-            logits = model(prompt_t, attention_mask=mask, kv_cache=ctx, position_ids=pos)
+            logits = model(prompt_t, forward_batch=fb, position_ids=pos)
 
         slot_indices_per_req.append(slots)
         prefill_logits.append(logits[0, -1, :])   # logit for first generated token
@@ -154,8 +156,9 @@ def run_lockstep(model, tok, n_steps: int):
             t    = torch.tensor([ids], device=DEVICE)
             mask = torch.ones(1, len(ids), dtype=torch.long, device=DEVICE)
             pos  = torch.arange(len(ids), device=DEVICE).unsqueeze(0)
+            fb_ref = ForwardBatch(mode=ForwardMode.PREFILL, kv_cache=None, attention_mask=mask)
             with torch.no_grad():
-                lg = model(t, attention_mask=mask, kv_cache=None, position_ids=pos)
+                lg = model(t, forward_batch=fb_ref, position_ids=pos)
             ref_logits.append(lg[0, -1, :])   # logit at last position
 
         # ── Paged decode: B=N DecodeKVCtx + FlashInfer ────────────────────────
@@ -199,14 +202,11 @@ def run_lockstep(model, tok, n_steps: int):
             v_pool    = kv_pool.v_pool,
             new_slots = new_slots_t,
         )
+        fb_dec = ForwardBatch(mode=ForwardMode.DECODE, kv_cache=ctx, attention_mask=None)
 
         with torch.no_grad():
-            bat_lg = model(
-                cur_toks,
-                attention_mask = None,
-                kv_cache       = ctx,
-                position_ids   = pos_ids,
-            )   # [B, 1, vocab]
+            bat_lg = model(cur_toks, forward_batch=fb_dec, position_ids=pos_ids)
+        # [B, 1, vocab]
 
         decode_wrapper.end_forward()
 
