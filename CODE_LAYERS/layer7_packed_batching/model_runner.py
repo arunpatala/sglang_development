@@ -50,8 +50,10 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+from forward_batch import ForwardBatch, ForwardMode
 from kv_cache import PackedKVCache, PerReqKVCache
 from model import Qwen3ForCausalLM
+from model.config import AttnBackend
 from request import Req, ReqStatus
 from tokenizer import Tokenizer
 
@@ -67,15 +69,21 @@ _WORKSPACE_MB = 256
 
 class ModelRunner:
 
-    def __init__(self, model_path: str) -> None:
-        logger.info(f"ModelRunner: loading model {model_path}")
+    def __init__(
+        self,
+        model_path:   str,
+        attn_backend: AttnBackend = AttnBackend.FLASHINFER,
+    ) -> None:
+        logger.info(f"ModelRunner: loading model {model_path}  backend={attn_backend.value}")
         t0 = time.perf_counter()
 
         self.tokenizer = Tokenizer(model_path)
         self.eos_id    = self.tokenizer.eos_token_id
         self.pad_id    = self.tokenizer.pad_token_id
 
-        self.model = Qwen3ForCausalLM.from_pretrained(model_path, dtype=DTYPE)
+        self.model = Qwen3ForCausalLM.from_pretrained(
+            model_path, dtype=DTYPE, attn_backend=attn_backend
+        )
 
         # Pre-allocate FlashInfer workspace once; reused every decode step.
         self._workspace = torch.empty(
@@ -115,8 +123,9 @@ class ModelRunner:
         pos  = torch.arange(len(req.input_ids), device=DEVICE).unsqueeze(0)  # [1, L]
 
         kv = PerReqKVCache()
+        fb = ForwardBatch(mode=ForwardMode.PREFILL, kv_cache=kv, attention_mask=mask)
         with torch.no_grad():
-            logits = self.model(ids, attention_mask=mask, kv_cache=kv, position_ids=pos)
+            logits = self.model(ids, forward_batch=fb, position_ids=pos)
 
         req.kv_cache      = kv
         req.t_first_token = time.perf_counter()
@@ -187,14 +196,11 @@ class ModelRunner:
             dtype        = DTYPE,
         )
 
-        # Forward pass — attention_mask=None because FlashInfer uses indptr.
+        # attention_mask=None — FlashInfer uses kv_indptr, not a mask tensor.
+        fb = ForwardBatch(mode=ForwardMode.DECODE, kv_cache=pack_kv, attention_mask=None)
         with torch.no_grad():
-            logits = self.model(
-                last_toks,
-                attention_mask=None,
-                kv_cache=pack_kv,
-                position_ids=pos_ids,
-            )   # [B, 1, vocab]
+            logits = self.model(last_toks, forward_batch=fb, position_ids=pos_ids)
+        # [B, 1, vocab]
 
         # Write new K/V tokens back to per-request caches.
         pack_kv.write_back()

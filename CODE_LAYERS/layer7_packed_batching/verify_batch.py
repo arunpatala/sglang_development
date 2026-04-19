@@ -42,8 +42,10 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+from forward_batch import ForwardBatch, ForwardMode
 from kv_cache import PackedKVCache, PerReqKVCache
 from model import Qwen3ForCausalLM
+from model.config import AttnBackend
 from tokenizer import Tokenizer
 
 ATOL = 0.75   # bfloat16 ~3 ULPs at logit scale 40
@@ -73,7 +75,9 @@ def bar(ok: bool) -> str:
 
 def load_model_and_tok(model_path: str):
     tok = Tokenizer(model_path)
-    mdl = Qwen3ForCausalLM.from_pretrained(model_path, dtype=DTYPE)
+    mdl = Qwen3ForCausalLM.from_pretrained(
+        model_path, dtype=DTYPE, attn_backend=AttnBackend.FLASHINFER
+    )
     return mdl, tok
 
 
@@ -105,9 +109,10 @@ def run_lockstep(model, tok, n_steps: int):
     for i in range(B):
         kv  = PerReqKVCache()
         pos = torch.arange(prompt_lens[i], device=DEVICE).unsqueeze(0)
+        fb  = ForwardBatch(mode=ForwardMode.PREFILL, kv_cache=kv,
+                           attention_mask=ind_mask_list[i])
         with torch.no_grad():
-            logits = model(ind_ids_list[i], attention_mask=ind_mask_list[i],
-                           kv_cache=kv, position_ids=pos)
+            logits = model(ind_ids_list[i], forward_batch=fb, position_ids=pos)
         ind_kvs.append(kv)
         ind_masks.append(ind_mask_list[i].clone())
         ind_logits.append(logits[0, -1, :])
@@ -136,9 +141,10 @@ def run_lockstep(model, tok, n_steps: int):
             )
             kv_len = ind_kvs[i].get_seq_length()
             pos    = torch.tensor([[kv_len]], dtype=torch.long, device=DEVICE)
+            fb_ind = ForwardBatch(mode=ForwardMode.PREFILL, kv_cache=ind_kvs[i],
+                                  attention_mask=ind_masks[i])
             with torch.no_grad():
-                lg = model(cur, attention_mask=ind_masks[i],
-                           kv_cache=ind_kvs[i], position_ids=pos)
+                lg = model(cur, forward_batch=fb_ind, position_ids=pos)
             ind_step_logits.append(lg[0, -1, :])
 
         # ── Batch decode via PackedKVCache + FlashInfer ────────────────────
@@ -155,9 +161,10 @@ def run_lockstep(model, tok, n_steps: int):
         pack_kv.plan(cfg.num_attention_heads, cfg.num_key_value_heads,
                      cfg.head_dim, DTYPE)
 
+        fb_bat = ForwardBatch(mode=ForwardMode.DECODE, kv_cache=pack_kv,
+                              attention_mask=None)
         with torch.no_grad():
-            bat_lg = model(bat_cur, attention_mask=None,
-                           kv_cache=pack_kv, position_ids=pos_ids)
+            bat_lg = model(bat_cur, forward_batch=fb_bat, position_ids=pos_ids)
 
         pack_kv.write_back()
         pack_kv.end_forward()

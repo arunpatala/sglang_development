@@ -1,11 +1,10 @@
-# Layer 4 — Custom Model Configuration
+# Layer 5 — Model Layers Configuration
 # --------------------------------------
 # Mirrors sglang's --config pattern (server_args_config_parser.py):
 #   CLI args  >  this file  >  Python hardcoded defaults
 #
 # Usage:
 #   python server.py                        # loads this file automatically
-#   python server.py --config config.yml    # explicit (same result)
 #   python server.py --port 8200            # overrides just the port; rest from here
 
 # ---------------------------------------------------------------------------
@@ -19,21 +18,26 @@ device: cuda
 # Server
 # ---------------------------------------------------------------------------
 host: "0.0.0.0"
-port: 8104
+port: 8105
 log_level: warning  # uvicorn access-log verbosity
 
 # ---------------------------------------------------------------------------
+# Scheduler
+# ---------------------------------------------------------------------------
+max_running: 16   # max requests in the decode batch simultaneously
+
+# ---------------------------------------------------------------------------
 # Generation behaviour
-# Layer 4 uses our own Qwen3ForCausalLM instead of AutoModelForCausalLM.
-# The generate_batch loop, left-padding, position_ids, and finished mask
-# are identical to Layer 3. Throughput matches Layer 3 within ~5%.
+# Layer 5 introduces the custom Qwen3 model stack (Qwen3Attention,
+# Qwen3DecoderLayer, Qwen3ForCausalLM) and a continuous-batching scheduler.
+# Prefill: B=1 per request (F.sdpa + PerReqKVCache).
+# Decode:  B=N padded to max_kv_len (F.sdpa + BatchedKVCache).
 # ---------------------------------------------------------------------------
 max_new_tokens: 128  # default when the request does not specify
 temperature: 1.0
 
 # ---------------------------------------------------------------------------
 # Benchmark (benchmark.py)
-# The benchmark sweeps over multiple batch sizes to show the throughput curve.
 # ---------------------------------------------------------------------------
 benchmark_num_requests: 20
 benchmark_max_new_tokens: 128

@@ -1,12 +1,12 @@
-# Layer 6 — Continuous Batching Configuration
+# Layer 7 — Packed Batching Configuration
 # --------------------------------------
 # Mirrors sglang's --config pattern (server_args_config_parser.py):
 #   CLI args  >  this file  >  Python hardcoded defaults
 #
 # Usage:
 #   python server.py                        # loads this file automatically
-#   python server.py --config config.yml    # explicit (same result)
 #   python server.py --port 8200            # overrides just the port; rest from here
+#   python server.py --attn-backend sdpa    # switch to F.sdpa for all paths
 
 # ---------------------------------------------------------------------------
 # Model
@@ -19,19 +19,21 @@ device: cuda
 # Server
 # ---------------------------------------------------------------------------
 host: "0.0.0.0"
-port: 8105
+port: 8106
 log_level: warning  # uvicorn access-log verbosity
 
 # ---------------------------------------------------------------------------
-# Scheduler
+# Attention backend
+# sdpa       — F.scaled_dot_product_attention for all paths (no extra deps)
+# flashinfer — FlashInfer ragged kernel for decode; F.sdpa for prefill
 # ---------------------------------------------------------------------------
-max_running: 16   # max requests in the decode batch simultaneously
+attn_backend: flashinfer
 
 # ---------------------------------------------------------------------------
 # Generation behaviour
-# Layer 6 replaces the static generate_batch loop with a continuous-batching
-# scheduler. Requests enter and leave the decode batch independently at every
-# step — a finished request is evicted immediately without waiting for others.
+# Layer 7 keeps the same continuous-batching scheduler from Layer 6.
+# The decode step replaces BatchedKVCache + F.sdpa with PackedKVCache +
+# FlashInfer ragged attention — no padding waste, same scheduling logic.
 # ---------------------------------------------------------------------------
 max_new_tokens: 128  # default when the request does not specify
 temperature: 1.0

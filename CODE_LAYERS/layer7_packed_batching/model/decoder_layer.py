@@ -25,27 +25,26 @@ from .norm import RMSNorm
 class Qwen3DecoderLayer(nn.Module):
     def __init__(self, config: Qwen3Config, layer_idx: int) -> None:
         super().__init__()
-        self.self_attn             = Qwen3Attention(config, layer_idx)
-        self.mlp                   = Qwen3MLP(config)
-        self.input_layernorm       = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.self_attn                = Qwen3Attention(config, layer_idx)
+        self.mlp                      = Qwen3MLP(config)
+        self.input_layernorm          = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
-        hidden_states: torch.Tensor,          # [B, q_len, hidden]
-        cos: torch.Tensor,                    # [B, q_len, head_dim]
-        sin: torch.Tensor,                    # [B, q_len, head_dim]
-        attention_mask: torch.Tensor | None,  # [B, 1, q_len, kv_len] additive
-        kv_cache=None,                        # KVCache | None
+        hidden_states: torch.Tensor,   # [B, q_len, hidden]
+        cos:           torch.Tensor,   # [B, q_len, head_dim]
+        sin:           torch.Tensor,   # [B, q_len, head_dim]
+        forward_batch,                 # ForwardBatch
     ) -> torch.Tensor:
         # ── Self-attention sublayer ───────────────────────────────────────
-        residual     = hidden_states
+        residual      = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, cos, sin, attention_mask, kv_cache)
+        hidden_states = self.self_attn(hidden_states, cos, sin, forward_batch)
         hidden_states = residual + hidden_states
 
         # ── MLP sublayer ──────────────────────────────────────────────────
-        residual     = hidden_states
+        residual      = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states

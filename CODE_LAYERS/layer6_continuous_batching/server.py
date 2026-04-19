@@ -1,5 +1,5 @@
 """
-Layer 5 — Server: async FastAPI + asyncio.Future bridge to the Scheduler.
+Layer 6 — Server: async FastAPI + asyncio.Future bridge to the Scheduler.
 
 The key pattern (mirrors SGLang's TokenizerManager):
 
@@ -17,9 +17,14 @@ The key pattern (mirrors SGLang's TokenizerManager):
 This decouples HTTP handling (async, I/O-bound) from GPU computation
 (sync, compute-bound) without them ever sharing a thread.
 
-Port: 8105
+Configuration is read from config.yml (same directory as this file).
+CLI args override individual fields:
+    python server.py                        # all values from config.yml
+    python server.py --port 8200            # override just the port
+    python server.py --max-running 8        # tighter decode batch cap
 """
 
+import argparse
 import asyncio
 import logging
 import sys
@@ -28,6 +33,7 @@ import uuid
 from pathlib import Path
 
 import uvicorn
+import yaml
 from fastapi import FastAPI
 from pydantic import BaseModel
 
@@ -38,6 +44,36 @@ from request import Req
 from scheduler import Scheduler
 from tokenizer import Tokenizer
 
+# ── Config ────────────────────────────────────────────────────────────────────
+
+_CONFIG_FILE = Path(__file__).parent / "config.yml"
+
+def _load_config(cli_overrides: dict) -> dict:
+    """Load config.yml, then apply any CLI overrides on top."""
+    with open(_CONFIG_FILE) as f:
+        cfg = yaml.safe_load(f)
+    cfg.update({k: v for k, v in cli_overrides.items() if v is not None})
+    return cfg
+
+def _parse_args() -> dict:
+    p = argparse.ArgumentParser(description="Layer 6 inference server")
+    p.add_argument("--model",       type=str, default=None)
+    p.add_argument("--port",        type=int, default=None)
+    p.add_argument("--host",        type=str, default=None)
+    p.add_argument("--log-level",   type=str, default=None, dest="log_level")
+    p.add_argument("--max-running", type=int, default=None, dest="max_running")
+    args = p.parse_args()
+    return {k: v for k, v in vars(args).items() if v is not None}
+
+_ARGS = _parse_args()
+_CFG  = _load_config(_ARGS)
+
+MODEL_PATH  = _CFG.get("model",       "Qwen/Qwen3-0.6B")
+PORT        = int(_CFG.get("port",    8105))
+HOST        = _CFG.get("host",        "0.0.0.0")
+LOG_LEVEL   = _CFG.get("log_level",   "warning")
+MAX_RUNNING = int(_CFG.get("max_running", 16))
+
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -45,13 +81,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ── Config ────────────────────────────────────────────────────────────────────
-MODEL_PATH      = "Qwen/Qwen3-0.6B"
-PORT            = 8105
-MAX_RUNNING     = 16     # max simultaneous decode requests
-
 # ── App state ─────────────────────────────────────────────────────────────────
-app       = FastAPI(title="Layer 5 — Continuous Batching")
+app       = FastAPI(title="Layer 6 — Continuous Batching")
 scheduler: Scheduler = None
 
 
@@ -62,7 +93,7 @@ class Message(BaseModel):
     content: str
 
 class ChatRequest(BaseModel):
-    model:       str = MODEL_PATH
+    model:       str   = MODEL_PATH
     messages:    list[Message]
     max_tokens:  int   = 128
     temperature: float = 0.0
@@ -81,12 +112,10 @@ class ChatResponse(BaseModel):
 async def chat(req_body: ChatRequest):
     tok: Tokenizer = scheduler.model_runner.tokenizer
 
-    # Format and tokenise the prompt
     messages   = [m.model_dump() for m in req_body.messages]
     prompt_str = tok.apply_chat_template(messages)
     input_ids  = tok.encode(prompt_str, device="cpu")[0].tolist()
 
-    # Create a Future in the current asyncio loop
     loop   = asyncio.get_event_loop()
     future = loop.create_future()
 
@@ -100,7 +129,6 @@ async def chat(req_body: ChatRequest):
 
     scheduler.add_request(req)
 
-    # Block until the scheduler resolves the future
     result = await future
     return ChatResponse(**result)
 
@@ -120,14 +148,11 @@ async def health():
 async def startup():
     global scheduler
 
-    logger.info("Loading model …")
+    logger.info(f"Starting  model={MODEL_PATH}  port={PORT}  max_running={MAX_RUNNING}")
     runner = ModelRunner(MODEL_PATH)
 
     scheduler = Scheduler(runner, max_running_reqs=MAX_RUNNING)
 
-    # Start the scheduler in a background daemon thread.
-    # Pass the running asyncio event loop so the scheduler can call
-    # loop.call_soon_threadsafe() to resolve futures.
     loop = asyncio.get_event_loop()
     t = threading.Thread(
         target=scheduler.run,
@@ -144,7 +169,7 @@ async def startup():
 if __name__ == "__main__":
     uvicorn.run(
         "server:app",
-        host="0.0.0.0",
+        host=HOST,
         port=PORT,
-        log_level="info",
+        log_level=LOG_LEVEL,
     )

@@ -5,14 +5,17 @@ Adds a /generate_batch endpoint that processes B requests in one GPU pass.
 /generate (single request) still works — it calls generate_batch internally.
 
 Run:
-    python server.py
+    python server.py                        # all values from config.yml
+    python server.py --port 8200            # override just the port; rest from config.yml
     python server.py --model Qwen/Qwen3-0.6B --port 8103
 """
 
 import argparse
 import logging
+from pathlib import Path
 
 import uvicorn
+import yaml
 from fastapi import FastAPI
 from pydantic import BaseModel
 
@@ -22,13 +25,31 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# CLI
+# Config  —  CLI args  >  config.yml  >  Python defaults
 # ---------------------------------------------------------------------------
 
+_HERE = Path(__file__).parent
+
+# Pre-parse --config so YAML is loaded before building the full arg parser.
+_pre = argparse.ArgumentParser(add_help=False)
+_pre.add_argument("--config", default=str(_HERE / "config.yml"))
+_pre_args, _ = _pre.parse_known_args()
+
+def _load_yaml(path: str) -> dict:
+    try:
+        with open(path) as f:
+            return yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        return {}
+
+_cfg = _load_yaml(_pre_args.config)
+
 parser = argparse.ArgumentParser(description="Layer 3 — static batching server")
-parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
-parser.add_argument("--host", default="0.0.0.0")
-parser.add_argument("--port", type=int, default=8103)
+parser.add_argument("--config",    default=str(_HERE / "config.yml"), help="Path to YAML config file")
+parser.add_argument("--model",     default=_cfg.get("model",     "Qwen/Qwen3-0.6B"))
+parser.add_argument("--host",      default=_cfg.get("host",      "0.0.0.0"))
+parser.add_argument("--port",      type=int, default=_cfg.get("port", 8103))
+parser.add_argument("--log-level", default=_cfg.get("log_level", "warning"), dest="log_level")
 args, _ = parser.parse_known_args()
 
 # ---------------------------------------------------------------------------
@@ -143,5 +164,5 @@ def stats():
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    logger.info(f"Starting Layer 3 server on {args.host}:{args.port}")
-    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+    logger.info(f"Starting Layer 3 server on {args.host}:{args.port}  model={args.model}")
+    uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)

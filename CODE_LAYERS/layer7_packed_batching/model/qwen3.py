@@ -33,7 +33,7 @@ from typing import Iterable, Tuple
 import torch
 import torch.nn as nn
 
-from .config import Qwen3Config
+from .config import AttnBackend, Qwen3Config
 from .decoder_layer import Qwen3DecoderLayer
 from .norm import RMSNorm
 from .rope import RotaryEmbedding
@@ -83,91 +83,33 @@ class Qwen3Model(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,                       # [B, q_len]
-        attention_mask: torch.Tensor | None,           # [B, kv_len] binary (1=real, 0=pad)
-        kv_cache=None,                                 # KVCache | None
-        position_ids: torch.Tensor | None = None,      # [B, q_len] explicit positions
+        input_ids:    torch.Tensor,                # [B, q_len]
+        forward_batch=None,                        # ForwardBatch | None
+        position_ids: torch.Tensor | None = None,  # [B, q_len] explicit positions
     ) -> torch.Tensor:
         B, q_len = input_ids.shape
+        kv_cache = forward_batch.kv_cache if forward_batch is not None else None
         past_len = kv_cache.get_seq_length() if kv_cache is not None else 0
 
         # ── Token embeddings ──────────────────────────────────────────────
         hidden = self.embed_tokens(input_ids)  # [B, q_len, hidden]
 
         # ── Position IDs and RoPE ─────────────────────────────────────────
-        # With left-padding, real tokens in shorter prompts are shifted right
-        # by `padding_amount` positions.  Without per-example position_ids,
-        # every batch element gets the same sequential [0..q_len-1] range, so
-        # real tokens in padded sequences get wrong RoPE positions.
-        # The caller should supply position_ids computed from attention_mask;
-        # we fall back to sequential positions only for B=1 (no padding).
+        # Caller supplies position_ids for batched/padded inputs.
+        # Fall back to sequential positions only for B=1 no-cache calls.
         if position_ids is None:
             position_ids = torch.arange(
                 past_len, past_len + q_len, device=input_ids.device
-            ).unsqueeze(0).expand(B, -1)                # [B, q_len]
-        cos, sin = self.rotary_emb(hidden, position_ids) # each [B, q_len, head_dim]
-
-        # ── Build additive attention mask ─────────────────────────────────
-        # Combines causal masking (future positions → -inf) with padding
-        # masking (pad positions → -inf).  Computed once, shared by all layers.
-        additive_mask = _build_additive_mask(
-            attention_mask=attention_mask,
-            q_len=q_len,
-            kv_len=past_len + q_len,
-            dtype=hidden.dtype,
-            device=hidden.device,
-        )
+            ).unsqueeze(0).expand(B, -1)                 # [B, q_len]
+        cos, sin = self.rotary_emb(hidden, position_ids)  # each [B, q_len, head_dim]
 
         # ── 28 × Decoder layers ───────────────────────────────────────────
+        # Mask construction moved into the backend (backend.py:build_additive_mask)
+        # so the FlashInfer path never builds a mask it does not need.
         for layer in self.layers:
-            hidden = layer(hidden, cos, sin, additive_mask, kv_cache)
+            hidden = layer(hidden, cos, sin, forward_batch)
 
         return self.norm(hidden)  # [B, q_len, hidden]
-
-
-def _build_additive_mask(
-    attention_mask: torch.Tensor | None,
-    q_len: int,
-    kv_len: int,
-    dtype: torch.dtype,
-    device: torch.device,
-) -> torch.Tensor | None:
-    """
-    Build a [B, 1, q_len, kv_len] additive mask:
-      0     → position is attended to
-      -inf  → position is masked (future token or padding)
-
-    For q_len == 1 (decode step): the causal part is all-zero because a
-    single query token can attend to every key in the cache.
-    """
-    NEG_INF = torch.finfo(dtype).min
-
-    # ── Causal mask ───────────────────────────────────────────────────────
-    # Upper-triangular positions are in the future → -inf.
-    # For q_len=1, triu(diagonal=kv_len) is empty, so causal is all zeros.
-    causal = torch.zeros(q_len, kv_len, dtype=dtype, device=device)
-    if q_len > 1:
-        # diagonal = kv_len - q_len + 1 so that position i can attend to
-        # positions 0..past_len+i (causal within the new tokens).
-        mask_upper = torch.ones(q_len, kv_len, dtype=torch.bool, device=device)
-        mask_upper = torch.triu(mask_upper, diagonal=kv_len - q_len + 1)
-        causal = causal.masked_fill(mask_upper, NEG_INF)
-
-    # [1, 1, q_len, kv_len] — broadcasts over batch and heads
-    causal = causal.unsqueeze(0).unsqueeze(0)
-
-    if attention_mask is None:
-        return causal
-
-    # ── Padding mask ──────────────────────────────────────────────────────
-    # attention_mask: [B, kv_len] binary (1=real, 0=pad)
-    # We need it to cover exactly kv_len columns.  During prefill kv_len ==
-    # prompt_len; during decode the caller extends it by 1 each step.
-    pad = attention_mask.to(dtype)                # 1.0 or 0.0
-    pad = (1.0 - pad) * NEG_INF                  # 0.0 or -inf
-    pad = pad[:, None, None, :]                   # [B, 1, 1, kv_len]
-
-    return causal + pad                           # [B, 1, q_len, kv_len]
 
 
 # ---------------------------------------------------------------------------
@@ -192,12 +134,11 @@ class Qwen3ForCausalLM(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,                      # [B, q_len]
-        attention_mask: torch.Tensor | None = None,   # [B, kv_len]
-        kv_cache=None,                                # KVCache | None
-        position_ids: torch.Tensor | None = None,     # [B, q_len]
-    ) -> torch.Tensor:                                # [B, q_len, vocab_size]
-        hidden = self.model(input_ids, attention_mask, kv_cache, position_ids)
+        input_ids:    torch.Tensor,                # [B, q_len]
+        forward_batch=None,                        # ForwardBatch | None
+        position_ids: torch.Tensor | None = None,  # [B, q_len]
+    ) -> torch.Tensor:                             # [B, q_len, vocab_size]
+        hidden = self.model(input_ids, forward_batch, position_ids)
         return self.lm_head(hidden)
 
     # ------------------------------------------------------------------ #
@@ -250,6 +191,7 @@ class Qwen3ForCausalLM(nn.Module):
         cls,
         model_path: str,
         dtype: torch.dtype = torch.bfloat16,
+        attn_backend: AttnBackend = AttnBackend.SDPA,
     ) -> "Qwen3ForCausalLM":
         """
         1. Resolve model_path → local directory (HF hub or local)
@@ -264,10 +206,12 @@ class Qwen3ForCausalLM(nn.Module):
         logger.info(f"Loading from: {model_dir}")
 
         config = Qwen3Config.from_json(model_dir / "config.json")
+        config.attn_backend = attn_backend
         logger.info(
             f"Config: {config.num_hidden_layers}L "
             f"h={config.hidden_size} "
-            f"heads={config.num_attention_heads}Q/{config.num_key_value_heads}KV"
+            f"heads={config.num_attention_heads}Q/{config.num_key_value_heads}KV "
+            f"backend={attn_backend.value}"
         )
 
         # Build model on CPU with float32 (default nn init dtype).

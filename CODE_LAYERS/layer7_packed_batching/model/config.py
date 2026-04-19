@@ -16,7 +16,13 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
+
+
+class AttnBackend(Enum):
+    SDPA       = "sdpa"        # F.scaled_dot_product_attention (prefill + decode)
+    FLASHINFER = "flashinfer"  # FlashInfer ragged kernel for decode, F.sdpa for prefill
 
 
 @dataclass
@@ -44,6 +50,11 @@ class Qwen3Config:
     attention_bias: bool = False
     tie_word_embeddings: bool = True
     hidden_act: str = "silu"
+
+    # Attention backend — set by ModelRunner, not read from config.json.
+    # SDPA: F.scaled_dot_product_attention for all paths (default, no deps).
+    # FLASHINFER: ragged packed attention for decode; F.sdpa for prefill.
+    attn_backend: AttnBackend = AttnBackend.SDPA
 
     # ------------------------------------------------------------------ #
     # Derived properties
