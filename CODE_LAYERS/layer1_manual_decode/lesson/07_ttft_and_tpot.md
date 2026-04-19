@@ -1,4 +1,4 @@
-# 06 — TTFT and TPOT
+# 07 — TTFT and TPOT
 
 ## Beyond Total Latency
 

@@ -21,14 +21,23 @@ Layer 0 called `model.generate()` and got text back. Layer 1 opens that black bo
 - Why we only look at the last position: `out.logits[0, -1, :]`
 - `use_cache=False` — prevents HuggingFace from building its own internal cache silently
 
-### 03 — Prefill and Decode (`03_prefill_and_decode.md`)
+### 03 — Causal Masking (`03_causal_masking.md`)
+- Why full attention would let the model cheat: seeing future tokens makes next-token prediction trivial
+- The mask: a triangular matrix that sets all future-position attention scores to `-∞` before softmax
+- What `-∞` scores become after softmax: exactly zero weight, so future positions contribute nothing
+- A worked 4-token example showing the score matrix before and after masking
+- How the mask enables parallel training: all positions trained simultaneously without leaking information
+- The key consequence: a token's key and value vectors depend only on what came before it and are immutable once computed
+- Why this is the reason the KV cache is a valid optimisation
+
+### 04 — Prefill and Decode (`04_prefill_and_decode.md`)
 - Even without a KV cache, these are two conceptually distinct phases
 - Prefill: step 0, processes all prompt tokens in parallel, cost dominated by prompt length
 - Decode: steps 1..N, each appends one token and reprocesses the full growing sequence
 - In layer1 the code looks identical for both — but naming them now prepares for layer2 where they genuinely diverge in implementation
 - Why the first step is more expensive than subsequent ones
 
-### 04 — Logits, Softmax, and Sampling (`04_logits_and_sampling.md`)
+### 05 — Logits, Softmax, and Sampling (`05_logits_and_sampling.md`)
 - What a logit is: raw unnormalised score from the model's final linear layer
 - Why you cannot interpret logits directly as probabilities
 - Softmax: converts logits to a probability distribution that sums to 1
@@ -37,7 +46,7 @@ Layer 0 called `model.generate()` and got text back. Layer 1 opens that black bo
 - `torch.multinomial`: drawing a sample from the probability distribution
 - The `sample_next_token` implementation in `sampling.py` covering all three cases
 
-### 05 — The Decode Loop Line by Line (`05_the_decode_loop.md`)
+### 06 — The Decode Loop Line by Line (`06_the_decode_loop.md`)
 - Full walkthrough of `NaiveModel.generate` in `model.py`
 - Initialise `ids = input_ids` (the prompt)
 - The `for step in range(max_new_tokens)` loop
@@ -46,7 +55,7 @@ Layer 0 called `model.generate()` and got text back. Layer 1 opens that black bo
 - `torch.cat` to grow the sequence by one token
 - After the loop: `tokenizer.decode(generated_ids, skip_special_tokens=True)`
 
-### 06 — TTFT and TPOT (`06_ttft_and_tpot.md`)
+### 07 — TTFT and TPOT (`07_ttft_and_tpot.md`)
 - Two new metrics added to the response schema in layer1
 - TTFT (Time To First Token): `step_times[0]` — cost of the first forward pass, which includes the full prompt
 - TPOT (Time Per Output Token): average of `step_times[1:]` — pure decode steps only
@@ -54,7 +63,7 @@ Layer 0 called `model.generate()` and got text back. Layer 1 opens that black bo
 - In layer1 with no cache, TPOT grows with sequence length because each step reprocesses more tokens
 - What these numbers will tell us once the KV cache is added in layer2
 
-### 07 — What Comes Next (`07_whats_next.md`)
+### 08 — What Comes Next (`08_whats_next.md`)
 - The surgical change layer2 makes: `past_key_values`
 - Because `model.py` owns the loop, the addition is a few lines in one file
 - `server.py` and `benchmark.py` do not change between layer1 and layer2

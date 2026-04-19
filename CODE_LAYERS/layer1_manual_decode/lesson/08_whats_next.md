@@ -1,4 +1,4 @@
-# 07 — What Comes Next
+# 08 — What Comes Next
 
 Layer 1 opened the black box. The generate loop is now in our code, every step is timed, and the two phases of generation — prefill and decode — are named and measured separately. The computation is identical to Layer 0: the same number of forward passes, the same cost per step, the same throughput numbers. What changed is visibility and control.
 

@@ -1,4 +1,4 @@
-# 04 — Logits, Softmax, and Sampling
+# 05 — Logits, Softmax, and Sampling
 
 ## What a Logit Is
 

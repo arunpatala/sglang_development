@@ -1,4 +1,4 @@
-# 05 — The Decode Loop
+# 06 — The Decode Loop
 
 ## The Complete `NaiveModel.generate`
 

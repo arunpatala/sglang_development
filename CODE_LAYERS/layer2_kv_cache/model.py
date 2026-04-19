@@ -38,6 +38,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from kv_cache import KVCache
+from sampling import sample_next_token
 
 logger = logging.getLogger(__name__)
 
@@ -48,15 +49,24 @@ class KVCacheModel:
     with past_key_values reuse. Only model.py changes vs Layer 1.
     """
 
-    def __init__(self, model_path: str):
+    _DTYPE_MAP = {
+        "bfloat16": torch.bfloat16,
+        "float16":  torch.float16,
+        "float32":  torch.float32,
+    }
+
+    def __init__(self, model_path: str, dtype: str = "bfloat16", device: str = "cuda"):
         logger.info(f"Loading model: {model_path}")
         t0 = time.perf_counter()
+
+        self.device = device
+        weight_dtype = self._DTYPE_MAP.get(dtype, torch.bfloat16)
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path,
-            torch_dtype=torch.bfloat16,
-        ).to("cuda")
+            torch_dtype=weight_dtype,
+        ).to(device)
         self.model.eval()
 
         self.eos_id = self.tokenizer.eos_token_id
@@ -65,22 +75,6 @@ class KVCacheModel:
         logger.info(
             f"GPU memory after load: {torch.cuda.memory_allocated() / 1024**2:.0f} MB"
         )
-
-    # ------------------------------------------------------------------
-    # Sampling helper  (identical to Layer 1)
-    # ------------------------------------------------------------------
-
-    def _sample_next_token(
-        self,
-        logits: torch.Tensor,   # shape: [vocab_size]
-        temperature: float,
-    ) -> int:
-        if temperature == 0.0:
-            return int(logits.argmax(dim=-1).item())
-        if temperature != 1.0:
-            logits = logits / temperature
-        probs = torch.softmax(logits, dim=-1)
-        return int(torch.multinomial(probs, num_samples=1).item())
 
     # ------------------------------------------------------------------
     # Public API — called by server.py  (identical signature to Layer 1)
@@ -101,7 +95,7 @@ class KVCacheModel:
             add_generation_prompt=True,
             enable_thinking=False,
         )
-        input_ids = self.tokenizer(formatted, return_tensors="pt").input_ids.to("cuda")
+        input_ids = self.tokenizer(formatted, return_tensors="pt").input_ids.to(self.device)
         prompt_tokens = input_ids.shape[1]
         logger.info(f"prompt_tokens={prompt_tokens}")
 
@@ -117,7 +111,7 @@ class KVCacheModel:
         past_kv = out.past_key_values          # same KVCache object, now populated
         logger.info(f"after prefill: {past_kv}")
         next_token_logits = out.logits[0, -1, :]
-        next_token_id = self._sample_next_token(next_token_logits, temperature)
+        next_token_id = sample_next_token(next_token_logits, temperature)
         ttft_ms = round((time.perf_counter() - t_prefill) * 1000, 1)
 
         generated_ids: list[int] = []
@@ -137,7 +131,7 @@ class KVCacheModel:
                 t_step = time.perf_counter()
 
                 current_token = torch.tensor(
-                    [[next_token_id]], dtype=torch.long, device="cuda"
+                    [[next_token_id]], dtype=torch.long, device=self.device
                 )
 
                 with torch.no_grad():
@@ -152,7 +146,7 @@ class KVCacheModel:
 
                 past_kv = out.past_key_values      # updated cache (one longer)
                 next_token_logits = out.logits[0, -1, :]
-                next_token_id = self._sample_next_token(next_token_logits, temperature)
+                next_token_id = sample_next_token(next_token_logits, temperature)
 
                 step_times.append(time.perf_counter() - t_step)
 

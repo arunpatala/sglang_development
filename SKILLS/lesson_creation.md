@@ -1,0 +1,273 @@
+---
+name: lesson-creation
+description: >-
+  Creates lesson materials for a new CODE_LAYERS layer. Use when adding a new
+  layer folder (layer3_*, layer4_*, etc.) and needing to create 00_outline.md,
+  summary.md, and the numbered section files. Captures the prose style, code
+  anchoring, and before/after narrative conventions established in layers 0–2.
+---
+
+# Lesson Creation
+
+Each layer in `CODE_LAYERS/` has a `lesson/` folder with three kinds of file:
+the outline, the summary, and the individual section files. All three follow
+specific conventions. Read this before creating any of them.
+
+---
+
+## 1. The Outline (`00_outline.md`)
+
+The outline is the planning document. Write it first. It defines the section
+list that all other files follow, so changes here propagate everywhere.
+
+### Structure
+
+```
+# Layer N — Lesson Outline
+
+## What This Lesson Covers
+[One short paragraph connecting to the previous layer. State what changes,
+what stays the same, and why the change matters.]
+
+---
+
+## Sections
+
+### 01 — Title (`01_title.md`)
+- bullet: what this section covers
+- bullet: key concept introduced
+- bullet: code anchor (file and rough line)
+
+### 02 — Title (`02_title.md`)
+...
+
+---
+
+## Supporting Files
+
+- `summary.md` — blog-post-style summary covering all sections
+- `sglang_reference.md` — maps layer concepts to SGLang source files
+
+---
+
+## Key Code Anchors
+
+| Concept | Location |
+|---|---|
+| [concept] | `model.py` line N: `code snippet` |
+```
+
+### Rules
+- Section numbers are zero-padded two digits: `01`, `02`, ..., `08`.
+- Each section entry has 4–6 bullets describing what that file covers. Bullets
+  in the outline can be concise; the section files are where detail lives.
+- The "Key Code Anchors" table is specific: include the actual line and a short
+  code snippet. Update it after writing `model.py` so line numbers are accurate.
+- Sections are ordered to follow the code top to bottom (not concept-first).
+  The natural reading order of `model.py` or the main changed file should
+  dictate section order.
+
+---
+
+## 2. The Summary (`summary.md`)
+
+The summary is a blog-post-style document that a reader could hand to someone
+who has not read any of the section files. It is more detailed than a typical
+blog post but shorter and less exhaustive than the individual sections.
+
+### Structure
+
+```
+# Layer N — Summary
+
+[One-sentence statement of what Layer N changes relative to Layer N-1.
+One-sentence statement of what is unchanged (API, server.py, benchmark.py).]
+
+---
+
+## From [Previous Layer] to [This Layer]
+
+[Show the key code from Layer N-1 — just enough to show what the problem was
+or what was hidden. Then show the equivalent code from Layer N immediately
+below. Explain the structural difference in one paragraph.]
+
+---
+
+## [Section Title matching 01_*.md]
+
+[Show the relevant code block from model.py.]
+
+[Explain what the code does and why, in prose. No bullet points.]
+
+---
+
+## [Section Title matching 02_*.md]
+...
+
+---
+
+## What Comes Next
+
+[One paragraph only. What does Layer N+1 change? What file does it touch?
+What metric improves? What stays the same? End with the repeating pattern:
+one concept changes, one file changes, the benchmark measures exactly that.]
+```
+
+### Rules
+
+- **Opening section must show "before" code and "after" code** side by side (or
+  stacked with labels). This is the structural anchor of the whole summary.
+  Use a comment label: `# Layer N-1 — ...` and `# Layer N — ...`.
+- **No bullet points anywhere in the body.** Every explanation is prose.
+- **Each section maps to exactly one section file** and covers the same
+  concepts, just less exhaustively.
+- **Code blocks are mandatory** in every section except "What Comes Next".
+  Show the actual snippet from the real file, not pseudocode, unless
+  illustrating a future layer.
+- **Section order in the summary must match the section file order** (01, 02,
+  03, ...). Do not reorganise for narrative flow at the expense of alignment.
+- **Tone**: clear, direct, technical. No hedging. No "it is important to note".
+  State facts and explain consequences.
+
+---
+
+## 3. Section Files (`01_title.md` … `0N_title.md`)
+
+Each section file is a textbook chapter: one self-contained topic, explained
+thoroughly in prose with embedded code snippets. It is more detailed than the
+summary section that covers the same topic.
+
+### File template
+
+```
+# NN — Title
+
+## [Subsection: the "before" state or the code anchor]
+
+[For the first section file: open by showing the Layer N-1 code (the "before")
+and the Layer N code (the "after"). Explain the structural difference.]
+
+[For all other section files: open by quoting the specific lines from model.py
+(or kv_cache.py, sampling.py, etc.) that this section explains. The code comes
+first, the explanation follows.]
+
+---
+
+## [Subsection: explanation]
+
+[Prose explanation. No bullet points. Explain what the code does, why it was
+written that way, and what would break if it were different.]
+
+---
+
+## [Subsection: consequence or next connection]
+
+[End with what this means for the next section or the next layer. Forward
+references are allowed here — it is the natural landing point.]
+```
+
+### Mandatory conventions
+
+**Open with the "before" code in section 01.**
+Section 01 is always the decode loop or the main generate method. It must show
+Layer N-1's version of the loop first (abbreviated to the key lines), then
+Layer N's new structure. This is the anchor the reader returns to mentally
+while reading every subsequent section.
+
+**Open with a code anchor in sections 02 onwards.**
+Every section after 01 opens by quoting the specific lines it explains. Do not
+open with abstract explanation and then show code — show the code and explain
+it. The pattern is: quote the code block, then explain it in prose below.
+
+Example opening for section 04 (explaining `past_key_values`):
+```markdown
+The decode loop in section 01 contains a line that appears after every model call:
+
+\`\`\`python
+past_kv = out.past_key_values
+\`\`\`
+
+This line is easy to read past, but it is where the cache contract between our
+code and HuggingFace's model internals is expressed. ...
+```
+
+**No bullet points.**
+Write in paragraphs. If listing things (e.g., three vectors in attention),
+introduce each with a bold term and follow with a sentence or two: `**The
+query** is what a token is asking for. ...`. This reads as prose while still
+being scannable.
+
+**Concrete code snippets with shape comments.**
+When showing tensors, always note the shape:
+```python
+out.logits        # shape: [batch, seq_len, vocab_size]
+out.logits[0, -1, :]   # shape: [vocab_size]
+```
+
+**Cross-reference earlier sections.**
+If a concept was established in a prior section, say so: "As section 02
+established, the causal mask ensures..." Do not re-explain concepts that have
+already been covered in the same layer.
+
+**Forward references only at the end of a section.**
+Do not mention Layer N+1 concepts mid-section. If a forward reference is
+needed, put it in the final paragraph of the section as a "this is what
+Layer N+1 changes" note.
+
+---
+
+## Narrative Arc (All Three Layers Follow This Pattern)
+
+Every layer lesson follows the same arc:
+
+1. **Start from the previous layer.** Show what the previous layer's code looked
+   like. State what was hidden or what the problem was.
+
+2. **Show the change.** Show the new code. State that the change is small (which
+   file changed, how many lines).
+
+3. **Explain each piece in code order.** Follow the model file top to bottom.
+   Each section explains one part of the generate method (or the supporting
+   file it delegates to).
+
+4. **Connect to the next layer.** The final section always points at the
+   remaining inefficiency and what Layer N+1 addresses.
+
+This arc appears at three levels: in the opening of `01_*.md`, in the opening
+section of `summary.md`, and implicitly in the "What Comes Next" section.
+
+---
+
+## File Naming
+
+```
+lesson/
+├── 00_outline.md
+├── 01_the_decode_loop.md      # always: the full generate method, layer comparison
+├── 02_[concept].md            # the new mechanism introduced by this layer
+├── 03_[concept].md
+├── ...
+├── 0N_benchmark_results.md    # always second-to-last: what the numbers show
+├── 0N+1_whats_next.md         # always last: what the next layer changes
+├── summary.md
+└── sglang_reference.md
+```
+
+`01_the_decode_loop.md` and the final two files are fixed. The middle sections
+vary by layer.
+
+---
+
+## Quick Checklist
+
+Before marking a layer's lesson complete:
+
+- [ ] `00_outline.md` has a Key Code Anchors table with accurate line numbers
+- [ ] `summary.md` opens by showing Layer N-1 code then Layer N code
+- [ ] Every summary section has at least one code block
+- [ ] No bullet points in summary or section files
+- [ ] Section 01 opens with the "before" (Layer N-1) then "after" (Layer N) loop
+- [ ] Sections 02+ open by quoting the specific code they explain
+- [ ] Section order matches outline order
+- [ ] "What Comes Next" (last section file and last summary section) names the
+      specific file and metric that Layer N+1 changes
