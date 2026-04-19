@@ -3,6 +3,8 @@ B. all test cases
 C. max_tokens, max_seqs, etc 
 D. use lifespan fastapi instead of events
 E. config and flag driven multi feature  and combine into single repo
+F. move from /generate to full openai chat completions endpoint
+
 
 0. advanced overlap scheduling
 1. implement as spec decoding2 dflash/ddtree 

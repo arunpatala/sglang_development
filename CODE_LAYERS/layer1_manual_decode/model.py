@@ -34,15 +34,24 @@ class NaiveModel:
     token, with no KV cache.
     """
 
-    def __init__(self, model_path: str):
+    _DTYPE_MAP = {
+        "bfloat16": torch.bfloat16,
+        "float16":  torch.float16,
+        "float32":  torch.float32,
+    }
+
+    def __init__(self, model_path: str, dtype: str = "bfloat16", device: str = "cuda"):
         logger.info(f"Loading model: {model_path}")
         t0 = time.perf_counter()
+
+        self.device = device
+        weight_dtype = self._DTYPE_MAP.get(dtype, torch.bfloat16)
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path,
-            torch_dtype=torch.bfloat16,
-        ).to("cuda")
+            torch_dtype=weight_dtype,
+        ).to(device)
         self.model.eval()
 
         self.eos_id = self.tokenizer.eos_token_id
@@ -108,7 +117,7 @@ class NaiveModel:
             add_generation_prompt=True,
             enable_thinking=False,
         )
-        input_ids = self.tokenizer(formatted, return_tensors="pt").input_ids.to("cuda")
+        input_ids = self.tokenizer(formatted, return_tensors="pt").input_ids.to(self.device)
         prompt_tokens = input_ids.shape[1]
 
         logger.info(f"prompt_tokens={prompt_tokens}")
@@ -144,7 +153,7 @@ class NaiveModel:
 
             # Append the new token and go again.
             next_token_tensor = torch.tensor(
-                [[next_token_id]], dtype=torch.long, device="cuda"
+                [[next_token_id]], dtype=torch.long, device=self.device
             )
             ids = torch.cat([ids, next_token_tensor], dim=1)
 

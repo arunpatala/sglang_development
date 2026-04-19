@@ -1,101 +1,146 @@
 # Layer 0 — Summary
 
-## What This Chapter Built
-
-A minimal, end-to-end LLM inference system: load a model, format a conversation, generate text, serve it over HTTP, and measure performance. Every subsequent layer in this curriculum improves on what is built here.
+This chapter builds the simplest possible LLM inference system from scratch. No tricks, no optimisations — just the fundamental pipeline that every production serving system is built on top of. By the end you have a working HTTP server that loads a real model, accepts conversations, generates text, and reports performance numbers that the rest of the curriculum will improve upon.
 
 ---
 
 ## Large Language Models
 
-An LLM is a neural network trained to predict the next token from text. From that single objective it develops the ability to answer questions, write code, summarise documents, and hold conversations. The model is a black box with a simple interface for this chapter: text goes in, text comes out.
+An LLM is a neural network trained on a massive corpus of text with one objective: given a sequence of tokens, predict what comes next. From this deceptively simple task, a model trained at sufficient scale develops a wide range of capabilities — answering questions, writing and debugging code, summarising documents, translating between languages, and holding extended conversations. None of these are explicitly programmed; they emerge from the training process itself.
 
-Qwen3-0.6B has 600 million parameters. At `bfloat16` (2 bytes per parameter) that is roughly 1.2 GB of GPU VRAM just for the weights — which is why the model is loaded once at startup and kept resident in memory for the lifetime of the server.
+For this chapter, the model is treated as a black box: text goes in, text comes out. The internal machinery will be opened up as the curriculum progresses. What matters right now is the interface and the cost of running it.
+
+The model used throughout is **Qwen3-0.6B**. At 600 million parameters stored in `bfloat16` (2 bytes each), the weights occupy roughly 1.2 GB of GPU VRAM. This is why the model is loaded once when the server starts and kept resident in memory — loading from disk takes several seconds and is far too expensive to repeat for every request.
 
 ---
 
 ## Tokens
 
-Models do not read characters or whole words; they read **tokens** — integer IDs that map to subword fragments. Common words are a single token; rarer or longer words are split into pieces (e.g. "tokenizer" → "token" + "izer"). Qwen3 has a vocabulary of 151,936 tokens.
+Models do not read text the way humans do. Internally, everything is integers. The tokenizer converts a string into a sequence of **token IDs**, each of which maps to a subword fragment in the model's vocabulary. Common words like "the" or "model" are a single token; longer or rarer words are split into pieces — "tokenizer" becomes "token" + "izer", and a Python identifier like `AutoModelForCausalLM` might become five or six fragments. Qwen3 has a vocabulary of 151,936 tokens, which keeps the vocabulary manageable while still being able to represent any string exactly.
 
-The tokenizer converts text to IDs (`encode`) and IDs back to text (`decode`). This round-trip happens at the boundary of every inference call. Token counts, not word counts, are the correct unit for measuring compute cost and for interpreting `prompt_tokens`, `completion_tokens`, and `max_new_tokens`.
+```python
+tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
 
-**Special tokens** carry structural meaning rather than text. The most important for inference is the end-of-sequence token (EOS): the model emits it when it considers its response complete, and the generate loop stops. Qwen3 also uses `<|im_start|>` and `<|im_end|>` to mark speaker turns.
+ids = tokenizer.encode("Hello, world!")   # string → list of ints
+text = tokenizer.decode(ids)              # list of ints → string
+```
+
+This round-trip — encode on the way in, decode on the way out — happens at the boundary of every inference call. Token counts are the correct unit for measuring compute cost, which is why the server reports `prompt_tokens` and `completion_tokens` rather than word counts, and why `max_new_tokens` is a token budget, not a word limit.
+
+Beyond regular text fragments, the tokenizer also defines **special tokens** that carry structural meaning. The most important is the end-of-sequence token (EOS): the model emits it when it considers its response complete, and the generate loop stops automatically. Qwen3 also uses `<|im_start|>` and `<|im_end|>` to mark the boundaries of each speaker's turn.
 
 ---
 
 ## Messages and the Chat Template
 
-A base model is a text completion engine — give it a prefix and it continues it. To behave as an assistant the model must be fine-tuned on structured conversations and then receive the same structure at inference time.
+A base language model is a completion engine — give it a prefix and it extends it. To get it to behave as an assistant, it must be fine-tuned on structured conversations, and at inference time you must format the input the same way those training conversations were formatted, or the model's behaviour is undefined.
 
-The standard format is a list of messages with roles:
+The standard format is a list of messages, each with a role and content:
 
 ```python
 messages = [
     {"role": "system",    "content": "You are a helpful assistant."},
     {"role": "user",      "content": "What is the capital of France?"},
+    {"role": "assistant", "content": "Paris."},
+    {"role": "user",      "content": "What is its population?"},
 ]
 ```
 
-`"system"` is the developer's instruction, `"user"` is the human, `"assistant"` is the model's reply. The model has no persistent memory — every request must include the full conversation history.
+The `"system"` role carries the developer's instruction that shapes the model's behaviour. The `"user"` role is the human. The `"assistant"` role is the model's prior replies. Critically, the model has no persistent memory between requests — every call must include the full conversation history as a flat list. If you omit the prior assistant turns, the model has no way to know the context of a follow-up question.
 
-`apply_chat_template` serialises the messages list into the formatted string the model was trained on, with `<|im_start|>` / `<|im_end|>` turn markers. `add_generation_prompt=True` appends the opening of the assistant's turn so the model knows to generate a reply. When it finishes, it emits `<|im_end|>` to close its turn; `skip_special_tokens=True` strips these markers from the decoded output.
+`apply_chat_template` serialises this list into the string format the model was trained on:
+
+```python
+formatted = tokenizer.apply_chat_template(
+    messages,
+    tokenize=False,
+    add_generation_prompt=True,
+    enable_thinking=False,
+)
+```
+
+The result is a string with `<|im_start|>` / `<|im_end|>` markers around each turn, ending with `<|im_start|>assistant\n` — the opening of the model's next reply. `add_generation_prompt=True` adds this final marker so the model knows it is now generating, not reading. When the model finishes generating, it emits `<|im_end|>` to close its turn; calling `tokenizer.decode(..., skip_special_tokens=True)` strips all these structural markers from the output so the caller receives clean text.
 
 ---
 
 ## Model Loading and the Generate Loop
 
+Models and tokenizers are hosted on **HuggingFace Hub** — a repository platform for machine learning models, similar to GitHub but for weights and configs. Passing a path like `"Qwen/Qwen3-0.6B"` to `from_pretrained` downloads the files on first use and caches them locally for subsequent runs.
+
+The complete inference pipeline looks like this:
+
 ```python
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
 tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
-model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-0.6B",
-            torch_dtype=torch.bfloat16).to("cuda")
+model = AutoModelForCausalLM.from_pretrained(
+    "Qwen/Qwen3-0.6B", torch_dtype=torch.bfloat16
+).to("cuda")
 model.eval()
 
-formatted  = tokenizer.apply_chat_template(messages, tokenize=False,
-                 add_generation_prompt=True, enable_thinking=False)
-input_ids  = tokenizer(formatted, return_tensors="pt").input_ids.to("cuda")
+messages = [{"role": "user", "content": "What is 2 + 2?"}]
+formatted = tokenizer.apply_chat_template(
+    messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
+)
+input_ids = tokenizer(formatted, return_tensors="pt").input_ids.to("cuda")
+prompt_len = input_ids.shape[1]
 
 with torch.no_grad():
     output_ids = model.generate(input_ids, max_new_tokens=64, use_cache=False)
 
-print(tokenizer.decode(output_ids[0, input_ids.shape[1]:], skip_special_tokens=True))
+print(tokenizer.decode(output_ids[0, prompt_len:], skip_special_tokens=True))
 ```
 
-Models and tokenizers are hosted on HuggingFace Hub and downloaded on first use. `from_pretrained` reads the architecture config and weight files; `.to("cuda")` moves weights to GPU VRAM. `model.eval()` disables dropout for deterministic output. `torch.no_grad()` skips gradient tracking, which is only needed during training. `model.generate` runs the autoregressive loop — one forward pass per token — until EOS or `max_new_tokens`. The output tensor includes the prompt; slicing from `prompt_len` extracts only the newly generated tokens.
+`torch_dtype=torch.bfloat16` loads weights at half precision, halving memory use with negligible quality impact. `.to("cuda")` moves them to GPU VRAM. `model.eval()` disables dropout so outputs are deterministic. `torch.no_grad()` turns off gradient tracking — only needed during training — saving memory and time on every forward pass.
+
+`model.generate` is the autoregressive loop: run a forward pass, pick the most likely next token, append it to the sequence, repeat. It stops when the model generates EOS or `max_new_tokens` is reached. The output tensor contains both the prompt and the completion concatenated; slicing from `prompt_len` extracts only the new tokens.
 
 ---
 
 ## The Inference Server
 
-Wrapping the generate loop in an HTTP server allows multiple clients to send requests over a network without the model being reloaded each time. FastAPI declares Python functions as endpoints:
+Wrapping the generate loop in an HTTP server allows any client to send requests over a network, indefinitely, without the model being reloaded. **FastAPI** makes this straightforward: decorate a Python function with an HTTP method and path, define the request and response shapes with Pydantic, and FastAPI handles the JSON parsing, validation, and serialisation automatically. **Uvicorn** handles the underlying network layer.
 
 ```python
-@app.post("/generate")
-def generate(req: GenerateRequest): ...
+@app.post("/generate", response_model=GenerateResponse)
+def generate(req: GenerateRequest):
+    # apply template, tokenize, generate, decode
+    return GenerateResponse(text=..., prompt_tokens=..., ...)
 ```
 
-FastAPI validates the incoming JSON against a Pydantic schema, calls the function, and serialises the return value back to JSON. Uvicorn handles the network layer underneath.
+The server reads its configuration from `config.yml` — model path, port, dtype, generation defaults — with command-line arguments taking precedence. This means you can run `python server.py --port 8200` to override a single setting without touching any code.
 
-The server reads configuration from `config.yml` with CLI arguments taking precedence, then the file, then hardcoded defaults. It exposes three endpoints: `POST /generate` for inference, `GET /health` for liveness checks, and `GET /stats` for GPU memory usage.
+Three endpoints are exposed. `POST /generate` is the main inference route. `GET /health` returns a quick liveness check used by the benchmark client before it starts sending requests. `GET /stats` reports current GPU memory usage, useful for sanity-checking that the model loaded correctly.
 
-The server processes one request at a time. A second request arriving while the first is running must wait — this is head-of-line blocking, and it causes wall latency to grow linearly with concurrent clients.
+One important limitation: the server processes one request at a time. A second request that arrives while the first is running must wait. With ten simultaneous clients, the tenth waits for all nine ahead of it. This is head-of-line blocking, and it is clearly visible in `test_client.py`'s concurrent test.
 
 ---
 
 ## Metrics and Benchmarking
 
-| Metric | What it measures |
-|---|---|
-| Output throughput (tok/s) | Generated tokens per second — the primary capacity metric |
-| Total throughput (tok/s) | Prompt + completion tokens per second |
-| Request rate (req/s) | Completed requests per second |
-| Latency (ms) | End-to-end time for a single request; p50 and p99 matter |
+Measuring performance precisely requires agreed-upon metrics and a reproducible workload. The three numbers that matter most for an LLM server are:
 
-`benchmark.py` samples 20 conversations from the ShareGPT dataset with a fixed seed and sends them sequentially, producing a reproducible result that can be compared directly across layers.
+**Output throughput** (tokens per second): how many generated tokens the server produces per second across all requests. This is the primary capacity metric — it tells you how much generative work the system can sustain.
+
+**Latency** (milliseconds): end-to-end time for a single request. Because requests vary in prompt length and output length, the median (p50) and tail (p99) both matter.
+
+**Request rate** (requests per second): how many complete requests finish per unit time. For a sequential server like Layer 0, this is just `1 / average_latency`.
+
+`benchmark.py` uses the **ShareGPT** dataset — real user conversations — sampled with a fixed seed for reproducibility. It sends 20 requests sequentially, records timing per request, and prints a summary. Running it against every layer with the same seed and dataset makes the numbers directly comparable.
 
 **Baseline on RTX 4060 Ti with Qwen3-0.6B:**
-- Output throughput: **114 tok/s**
-- Average latency: **1418 ms**
-- Request rate: **0.70 req/s**
 
-Every subsequent chapter is measured against these numbers.
+| Metric | Value |
+|---|---|
+| Output throughput | 114 tok/s |
+| Average latency | 1418 ms |
+| Request rate | 0.70 req/s |
+
+These are the numbers every subsequent chapter is measured against.
+
+---
+
+## What Comes Next
+
+Layer 0 is the base engine: correct, complete, and unoptimised. Each chapter that follows makes one targeted improvement — speeding up the generate loop, batching multiple requests together, handling concurrency without blocking, managing memory more carefully, and eventually quantising the model to fit more throughput into the same hardware. Every change is measured with the same benchmark, so progress is always visible.

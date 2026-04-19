@@ -1,0 +1,39 @@
+# Layer 1 — Manual Decode Loop Configuration
+# --------------------------------------------
+# Mirrors sglang's --config pattern (server_args_config_parser.py):
+#   CLI args  >  this file  >  Python hardcoded defaults
+#
+# Usage:
+#   python server.py                        # loads this file automatically
+#   python server.py --config config.yml    # explicit (same result)
+#   python server.py --port 8200            # overrides just the port; rest from here
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+model: Qwen/Qwen3-0.6B
+dtype: bfloat16     # weight dtype loaded onto the GPU (bfloat16 halves memory vs float32)
+device: cuda
+
+# ---------------------------------------------------------------------------
+# Server
+# ---------------------------------------------------------------------------
+host: "0.0.0.0"
+port: 8101
+log_level: warning  # uvicorn access-log verbosity
+
+# ---------------------------------------------------------------------------
+# Generation behaviour
+# Layer 1 owns the decode loop explicitly in model.py.
+# The loop always runs without caching — same O(seq^2) cost as Layer 0.
+# This is what we will optimise in Layer 2 by adding past_key_values.
+# ---------------------------------------------------------------------------
+max_new_tokens: 64   # default when the request does not specify
+temperature: 1.0
+
+# ---------------------------------------------------------------------------
+# Benchmark (benchmark.py)
+# ---------------------------------------------------------------------------
+benchmark_num_requests: 20
+benchmark_max_new_tokens: 128
+benchmark_seed: 42
