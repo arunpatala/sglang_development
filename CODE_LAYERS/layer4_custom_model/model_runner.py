@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from kv_cache import KVCache
 from model import Qwen3ForCausalLM
+from sampling import sample_batch
 from tokenizer import Tokenizer
 
 logger = logging.getLogger(__name__)
@@ -51,22 +52,6 @@ class BatchedModel:
         logger.info(
             f"GPU memory after load: {torch.cuda.memory_allocated() / 1024**2:.0f} MB"
         )
-
-    # ------------------------------------------------------------------
-    # Sampling
-    # ------------------------------------------------------------------
-
-    def _sample_batch(
-        self,
-        logits: torch.Tensor,   # [B, vocab_size]
-        temperature: float,
-    ) -> torch.Tensor:           # [B]
-        if temperature == 0.0:
-            return logits.argmax(dim=-1)
-        if temperature != 1.0:
-            logits = logits / temperature
-        probs = torch.softmax(logits, dim=-1)
-        return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
     # ------------------------------------------------------------------
     # Single request (delegates to generate_batch with B=1)
@@ -132,7 +117,7 @@ class BatchedModel:
         logger.info(f"after prefill: {kv}  ttft={ttft_ms}ms")
 
         # Sample first token from the LAST position of each sequence.
-        next_tokens = self._sample_batch(logits[:, -1, :], temperature)  # [B]
+        next_tokens = sample_batch(logits[:, -1, :], temperature)  # [B]
 
         # ── Decode loop ───────────────────────────────────────────────
         finished   = next_tokens == self.eos_id
@@ -179,7 +164,7 @@ class BatchedModel:
                     position_ids=decode_pos,
                 )
 
-            next_tokens = self._sample_batch(logits[:, -1, :], temperature)
+            next_tokens = sample_batch(logits[:, -1, :], temperature)
             step_times.append(time.perf_counter() - t_step)
 
             newly_finished = next_tokens == self.eos_id
