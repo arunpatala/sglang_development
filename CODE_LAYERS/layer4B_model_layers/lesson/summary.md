@@ -1,103 +1,44 @@
-# Layer 4 — Summary
+# Layer 4B — Summary
 
-Layer 4 replaces `AutoModelForCausalLM.from_pretrained` with our own `Qwen3ForCausalLM`, implementing the full Qwen3 architecture in a `model/` package we can read and modify. The computation is identical to Layer 3 — the `generate_batch` loop, tokenizer, left-padding, position IDs, and finished mask are all carried over unchanged. What changes is ownership: every tensor, every weight, every forward-pass step is now in code we control.
+Layer 4A took ownership of config reading and weight loading while keeping HuggingFace's Qwen3 as the forward computation. Layer 4B completes the picture: `self._model` — the HF `AutoModelForCausalLM` that did the actual computation — is replaced with our own `Qwen3Model`. The forward call returns a plain logits tensor, the KV cache is passed directly to our attention layers, and every step of the computation is now in code we can read and modify.
+
+The `from_pretrained`, `load_weights`, and `Qwen3Config` code from Layer 4A carries over to Layer 4B unchanged — loading is told once and done. The new code lives in five files: `norm.py`, `mlp.py`, `rope.py`, `attention.py`, and `decoder_layer.py`, composed into `Qwen3Model` and `Qwen3ForCausalLM` in `model/qwen3.py`.
 
 ---
 
-## From Layer 3 to Layer 4
+## From Layer 4A to Layer 4B
 
-In Layer 3, two lines in `model_runner.py` handed the architecture entirely to HuggingFace:
+In Layer 4A, the forward call used HuggingFace's interface. `past_key_values` was the HF-compatible cache handle, and the call returned a `(logits, past_kv)` tuple whose second value was discarded because the `KVCache` updated itself in-place:
 
 ```python
-# Layer 3
-from transformers import AutoModelForCausalLM
-self.model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch.bfloat16).to("cuda")
+# Layer 4A — forward call
+kv = KVCache()
+logits, _ = self.model(ids, attention_mask=mask,
+                       past_key_values=kv, position_ids=pos)
+logits = logits[:, -1, :]
 ```
 
-The forward call returned a `ModelOutput` namedtuple. Getting logits required indexing into it, and the KV cache had to be re-assigned from the output on every decode step:
+In Layer 4B, our attention layers call `kv_cache.update(layer_idx, k, v)` directly. There is no HF adapter, no tuple to unpack — the call returns logits and nothing else:
 
 ```python
-# Layer 3 — forward call
-out = self.model(input_ids=ids, attention_mask=mask,
-                 past_key_values=kv, use_cache=True)
-past_kv = out.past_key_values   # must re-assign every step
-logits  = out.logits[:, -1, :]
-```
-
-In Layer 4, the import and init become:
-
-```python
-# Layer 4
-from model import Qwen3ForCausalLM
-self.model = Qwen3ForCausalLM.from_pretrained(model_path, dtype=torch.bfloat16)
-```
-
-The forward call returns a logits tensor directly. The `KVCache` is mutated in-place by each attention layer, so there is nothing to re-assign:
-
-```python
-# Layer 4 — forward call
+# Layer 4B — forward call
+kv = KVCache()
 logits = self.model(ids, attention_mask=mask,
                     kv_cache=kv, position_ids=pos)
-logits = logits[:, -1, :]       # kv already updated, no re-assign
+logits = logits[:, -1, :]
 ```
 
-Everything else in `generate_batch` — the prefill, the decode loop, `sample_batch`, the finished mask — is byte-for-byte identical to Layer 3. The `model/` package is the only new code. Inside `Qwen3ForCausalLM.forward`, input IDs are embedded, RoPE rotation matrices are precomputed from position IDs, an additive causal-plus-padding mask is built, and the result is passed through 28 identical decoder layers before a final projection to vocabulary size. The sections below explain each of those steps in that order: config and weight loading, the decoder block, rotary embeddings, the additive mask, and attention.
+That two-word change in the call signature — `past_key_values=kv` → `kv_cache=kv`, and unpacking `logits, _` → assigning `logits` — is the entire visible diff in `model_runner.py`. Everything else in `generate_batch` is unchanged from Layer 4A and Layer 3.
 
----
-
-## Config and Weight Loading
-
-`Qwen3Config` is a plain `@dataclass` with a `from_json()` classmethod:
-
-```python
-@dataclass
-class Qwen3Config:
-    vocab_size: int = 151_936
-    hidden_size: int = 1_024
-    num_hidden_layers: int = 28
-    num_attention_heads: int = 16
-    num_key_value_heads: int = 8
-    head_dim: int = 128
-    rope_theta: float = 1_000_000.0
-    tie_word_embeddings: bool = True
-    ...
-```
-
-HuggingFace's `PretrainedConfig` adds roughly a thousand lines of serialisation, hub-download, and legacy-compatibility machinery. All we need are the numeric hyperparameters, so a dataclass suffices.
-
-`from_pretrained()` runs five steps:
-
-```python
-@classmethod
-def from_pretrained(cls, model_path, dtype=torch.bfloat16):
-    model_dir = _resolve_model_path(model_path)           # Step 1 — local dir or HF Hub
-    config    = Qwen3Config.from_json(model_dir / "config.json")  # Step 2 — read hyperparams
-    model     = cls(config)                               # Step 3 — build on CPU
-    model     = model.to(dtype)                           # Step 4 — cast BEFORE copy
-    model.load_weights(_iter_safetensors(model_dir, dtype))       # Step 5 — stream weights
-    return model.to("cuda").eval()
-```
-
-Casting to `bfloat16` before copying weights (Step 4) means `copy_` writes `bfloat16` directly into `bfloat16` parameters — one memory operation instead of two. Streaming weights one tensor at a time via `safe_open` avoids the double-memory spike that would occur if all weights were buffered first.
-
-`load_weights()` receives an iterator of `(name, tensor)` pairs and copies each tensor into the matching parameter:
-
-```python
-params = dict(self.named_parameters())
-for name, tensor in weights:
-    if name in params:
-        params[name].data.copy_(tensor)
-```
-
-After the loop, if `tie_word_embeddings` is true, `lm_head.weight` is pointed at `embed_tokens.weight` so they share memory. For a model the size of Qwen3-0.6B this saves around 600 MB of GPU memory; for larger models the saving scales with vocabulary size times hidden dimension.
+Inside `Qwen3ForCausalLM.forward`, input IDs are embedded, RoPE rotation matrices are precomputed from position IDs, an additive causal-plus-padding mask is built, and the result is passed through 28 identical decoder layers before a final projection to vocabulary size. The sections below explain each of those steps in execution order.
 
 ---
 
 ## RMSNorm and the Decoder Layer
 
-Each `layer(hidden, cos, sin, additive_mask, kv_cache)` call in `Qwen3Model.forward` is a `Qwen3DecoderLayer` — one transformer block — executing the normalise-attend-add-normalise-MLP-add pattern 28 times in sequence.
+Each call in `Qwen3Model.forward` passes through a `Qwen3DecoderLayer` — one transformer block — executing the normalise-attend-add-normalise-MLP-add pattern 28 times in sequence.
 
-Every normalisation in the model — four uses per layer plus the final norm — goes through the same `RMSNorm`:
+Every normalisation in the model goes through the same `RMSNorm`:
 
 ```python
 def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -123,13 +64,13 @@ hidden_states = self.mlp(hidden_states)
 hidden_states = residual + hidden_states
 ```
 
-The MLP is a SwiGLU feed-forward network: `down_proj(silu(gate_proj(x)) * up_proj(x))`. Two parallel projections replace the single up-projection of a standard FFN. `gate_proj` produces a learned gating signal passed through `silu`; `up_proj` provides the content vector. Element-wise multiplication acts as a soft gate before `down_proj` projects back to `hidden_size`.
+The MLP is a SwiGLU feed-forward network: `down_proj(silu(gate_proj(x)) * up_proj(x))`. `gate_proj` produces a learned gating signal through `silu`; `up_proj` provides the content vector. Element-wise multiplication acts as a soft gate before `down_proj` projects back to `hidden_size`.
 
 ---
 
 ## Rotary Position Embedding
 
-RoPE encodes position by rotating each query and key vector by an angle that depends on the token's absolute position. The rotation is constructed from a set of frequencies precomputed once at model initialisation:
+RoPE encodes position by rotating each query and key vector by an angle that depends on the token's absolute position. The rotation frequencies are precomputed once at model initialisation:
 
 ```python
 inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
@@ -153,23 +94,13 @@ q_rot = (q * cos) + (rotate_half(q) * sin)   # [B, n_heads, q_len, head_dim]
 k_rot = (k * cos) + (rotate_half(k) * sin)   # [B, n_kv_heads, q_len, head_dim]
 ```
 
-The key property of this rotation is that the dot product `Q_i · K_j` depends only on the relative distance `(i − j)` between the two positions. The attention logit naturally encodes how far apart two tokens are without any learned position embeddings. The `(cos, sin)` pair is computed once per forward pass in `Qwen3Model.forward` and passed to all 28 decoder layers, avoiding redundant recomputation.
+The key property is that the dot product `Q_i · K_j` depends only on the relative distance `(i − j)`. The `(cos, sin)` pair is computed once per forward pass in `Qwen3Model.forward` and passed to all 28 decoder layers — no per-layer recomputation.
 
 ---
 
 ## The Additive Attention Mask
 
-In Layer 3, a binary `attention_mask` was passed to HuggingFace's model, which built its internal additive mask in code we could not see. In Layer 4, `_build_additive_mask` constructs it explicitly in one place and passes the result to every attention layer:
-
-```python
-additive_mask = _build_additive_mask(
-    attention_mask=attention_mask,
-    q_len=q_len,
-    kv_len=past_len + q_len,
-    dtype=hidden.dtype,
-    device=hidden.device,
-)
-```
+In Layer 4A, a binary `attention_mask` was passed to HuggingFace, which built its internal additive mask in code we could not see. In Layer 4B, `_build_additive_mask` constructs it explicitly in one place and passes the result to every attention layer.
 
 The mask combines two parts. The causal part prevents any query token from attending to future key positions:
 
@@ -187,7 +118,7 @@ The padding part converts the binary mask to additive form:
 pad = (1.0 - attention_mask.to(dtype)) * NEG_INF   # [B, 1, 1, kv_len]
 ```
 
-Adding the two parts and broadcasting gives the final `[B, 1, q_len, kv_len]` tensor. This is the `attention_mask` passed into every `Qwen3Attention.forward` call and handed directly to SDPA.
+Adding the two parts and broadcasting gives the final `[B, 1, q_len, kv_len]` tensor. This is passed directly into SDPA as `attn_mask`.
 
 ---
 
@@ -205,57 +136,42 @@ v = self.v_proj(hidden_states).view(B, q_len, self.num_kv_heads, self.head_dim)
 Before RoPE is applied, each head's Q and K vectors are normalised independently:
 
 ```python
-q = self.q_norm(q)   # [B, q_len, 16, 128] — normalises last dim per head
+q = self.q_norm(q)   # [B, q_len, 16, 128]
 k = self.k_norm(k)   # [B, q_len,  8, 128]
 ```
 
-This per-head QK `RMSNorm` is specific to Qwen3. It is not present in Llama or Qwen2. The weight for each norm is a `[head_dim=128]` vector, so the normalisation scales independently per head dimension rather than per sequence position. It stabilises attention logits at large model scales where per-head Q/K magnitudes can diverge.
-
-RoPE is then applied using the `(cos, sin)` pair computed once by `Qwen3Model` and passed down to every layer:
+This per-head QK `RMSNorm` is specific to Qwen3 — not present in Llama or Qwen2. It stabilises attention logits at large model scales where per-head Q/K magnitudes can diverge. After normalisation, RoPE is applied and the K/V are written to the cache:
 
 ```python
 q, k = apply_rotary_pos_emb(q, k, cos, sin)
-# q: [B, q_len, 16, 128]   k: [B, q_len, 8, 128]
+k, v = kv_cache.update(self.layer_idx, k, v)   # k: [B, kv_len, 8, 128]
 ```
 
-The rotated K and V are appended to the cache so the decode step can attend to all prior tokens:
-
-```python
-k, v = kv_cache.update(self.layer_idx, k, v)
-# k: [B, kv_len, 8, 128]   v: [B, kv_len, 8, 128]
-```
-
-With the cache updated, 8 KV heads must serve 16 Q heads. `repeat_kv` handles this without copying data — it uses `expand` (a view) followed by `reshape` to go from `[B, 8, kv_len, 128]` to `[B, 16, kv_len, 128]`.
-
-The attention score for query position `i` attending to key position `j` is:
+With the cache updated, 8 KV heads must serve 16 Q heads. `repeat_kv` handles this without copying data — it uses `expand` (a view) followed by `reshape`:
 
 ```
-Attention(Q, K, V) = softmax( Q · Kᵀ / √head_dim ) · V
+[B, 8, kv_len, 128] → [B, 16, kv_len, 128]
 ```
 
-`Q · Kᵀ` produces a `[B, n_heads, q_len, kv_len]` score matrix. Dividing by `√head_dim` (= `√128` ≈ 11.3) prevents the dot products from growing large enough to push softmax into regions where gradients vanish. The additive mask is added before softmax, setting future and padding positions to `−inf` so they contribute zero weight. The weighted sum over V then produces the attended output.
-
-In code this is a single call:
+Attention is then computed with a single SDPA call:
 
 ```python
 attn_out = F.scaled_dot_product_attention(
     q, k, v,
     attn_mask=attention_mask,   # [B, 1, q_len, kv_len] additive
     scale=self.scale,           # 1 / √head_dim
-)  # [B, n_heads, q_len, head_dim]
+)
 ```
 
-PyTorch's `scaled_dot_product_attention` dispatches to FlashAttention on CUDA when the inputs are contiguous and in a supported dtype, fusing the `Q · Kᵀ`, scale, mask, softmax, and `· V` steps into a single kernel that never materialises the full score matrix in HBM. The output is transposed and reshaped back to `[B, q_len, hidden]` before the output projection `o_proj`.
+`scaled_dot_product_attention` dispatches to FlashAttention on CUDA, fusing the `Q · Kᵀ`, scale, mask, softmax, and `· V` steps into a single kernel that never materialises the full score matrix in HBM.
 
 ---
 
 ## The Full Loop
 
-Now that all the parts have been explained, it is worth tracing the full lifecycle — from server startup through a single `generate_batch` call — to see how they connect.
+Before any request arrives, `BatchedModel.__init__` loads the model. `Qwen3ForCausalLM.from_pretrained` handles path resolution, config reading, HF skeleton construction, weight streaming, and the `lm_head` tie — all covered in Layer 4A and unchanged here.
 
-Before any request arrives, `BatchedModel.__init__` loads the model. `Qwen3ForCausalLM.from_pretrained` first resolves the model path, then calls `Qwen3Config.from_json` to read `config.json` into a plain dataclass — no HuggingFace machinery involved. It constructs `Qwen3ForCausalLM(config)` on CPU, casts it to `bfloat16`, then streams weight tensors from `model.safetensors` one at a time via `safe_open`, copying each into the matching parameter with `params[name].data.copy_(tensor)`. After the loop, `lm_head.weight` is pointed at `embed_tokens.weight` to share memory. The model is then moved to CUDA and set to eval mode. From this point on `self.model` is our own `Qwen3ForCausalLM` — every subsequent forward call goes through code we can read.
-
-The call arrives with B conversations. `tokenizer.prepare_batch` formats each with `apply_chat_template`, tokenises with `padding=True` and left-alignment, and returns `input_ids [B, max_prompt_len]`, `attention_mask [B, max_prompt_len]`, and `prompt_lens_list`. The prefill position IDs are computed from `attention_mask` with the `cumsum` formula from Layer 3 — unchanged.
+A call arrives with B conversations. `tokenizer.prepare_batch` formats and left-pads them, returning `input_ids [B, max_prompt_len]`, `attention_mask`, and `prompt_lens_list`. The prefill position IDs are computed from `attention_mask` with the `cumsum` formula from Layer 3.
 
 A fresh `KVCache()` is created and `Qwen3ForCausalLM.forward` is called for the prefill. The skeleton of `Qwen3Model.forward` makes the execution order explicit:
 
@@ -275,18 +191,14 @@ def forward(self, input_ids, attention_mask, kv_cache, position_ids):
     return self.norm(hidden)                                 # [B, q_len, hidden]
 ```
 
-Four things happen before the layer loop: the token IDs are embedded, the RoPE `(cos, sin)` pair is computed once from `position_ids`, the additive causal-plus-padding mask is built once, and `past_len` is read from the cache so the mask covers the correct `kv_len`.
+Four things happen before the layer loop: token IDs are embedded, the RoPE `(cos, sin)` pair is computed once from `position_ids`, the additive mask is built once, and `past_len` is read from the cache so the mask covers the correct `kv_len`. Each of the 28 `Qwen3DecoderLayer` blocks receives the same `cos`, `sin`, `additive_mask`, and `kv_cache` reference — no recomputation per layer. After all 28 layers, the final `RMSNorm` and `lm_head` produce `logits [B, max_prompt_len, vocab_size]`. The `[:, -1, :]` slice extracts last-position logits, `sample_batch` draws `next_tokens [B]`, and TTFT is recorded.
 
-Each of the 28 `Qwen3DecoderLayer` blocks receives the same `cos`, `sin`, `additive_mask`, and `kv_cache` reference — no recomputation per layer. Inside each block, pre-norm is applied, then `Qwen3Attention` projects Q/K/V, applies per-head QK norm, applies RoPE, calls `kv_cache.update(layer_idx, k, v)`, expands K/V for GQA with `repeat_kv`, and runs SDPA. The attention output is added back to the residual, a second pre-norm is applied, the SwiGLU MLP runs, and its output is added back to the residual.
-
-After all 28 layers the final `RMSNorm` and `lm_head` produce `logits [B, max_prompt_len, vocab_size]`. The `[:, -1, :]` slice extracts last-position logits, `sample_batch` draws `next_tokens [B]`, and TTFT is recorded.
-
-The decode loop runs exactly as in Layer 3. Finished requests receive `pad_id` via `torch.where`; the attention mask grows by one column of ones; per-request `decode_pos` is `prompt_lens + decode_step`. The same `Qwen3ForCausalLM.forward` is called with `current [B, 1]` — this time `q_len=1`, so the causal mask is all-zeros and the single query token attends to every key in the growing cache without restriction. `sample_batch` draws the next `[B]` tokens, `finished` is updated with `|=`, and the loop exits when `finished.all()` is true.
-
-After the loop, `tokenizer.decode_batch` converts each request's token list to text. One result dict is assembled per request with individual token counts and the shared `ttft_ms` and `tpot_ms` from the batched computation. The caller receives the same response format as Layer 3.
+The decode loop runs exactly as in Layer 4A and Layer 3. Finished requests receive `pad_id` via `torch.where`; the attention mask grows by one column of ones; per-request `decode_pos` is `prompt_lens + decode_step`. The same `Qwen3ForCausalLM.forward` is called with `current [B, 1]` — `q_len=1`, so the causal mask is all-zeros and the single query token attends to every key in the growing cache. The loop exits when `finished.all()` is true.
 
 ---
 
 ## What Comes Next
 
-Layer 4 does not change the scheduling primitive: `generate_batch` still holds the entire batch until the longest request finishes, and head-of-line blocking remains. Layer 5 (`layer5_continuous_batching`) addresses this by introducing a `Scheduler`, `Request`, and `Batch` object. Finished requests are evicted from the batch mid-loop; new requests enter with their own prefill injected at the next step. The `model/` package and `kv_cache.py` from Layer 4 are carried over unchanged — the architecture is not touched. The work moves into the scheduler that decides, at each step, which requests participate in the next forward pass and what shape the input tensor takes.
+Layer 4B does not change the scheduling primitive: `generate_batch` still holds the entire batch until the longest request finishes. Head-of-line blocking remains — a 5-token request is held until a co-batched 1000-token request completes.
+
+Layer 5 (`layer5_continuous_batching`) addresses this by introducing a `Scheduler`, `Request`, and `Batch` object. Finished requests are evicted from the batch mid-loop; new requests enter with their own prefill injected at the next step. The `model/` package and `kv_cache.py` from Layer 4B are carried over unchanged — the architecture is not touched. The work moves into the scheduler that decides, at each step, which requests participate in the next forward pass and what shape the input tensor takes.

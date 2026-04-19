@@ -1,6 +1,6 @@
-# 07 — The Full Loop
+# 06 — The Full Loop
 
-Sections 01 through 06 explained each component individually. This section traces one complete `generate_batch` call from server startup to the returned result dicts, naming every concept in the order it executes.
+Sections 01 through 05 explained each component individually. This section traces one complete `generate_batch` call from server startup to the returned result dicts, naming every concept in the order it executes.
 
 ---
 
@@ -12,7 +12,7 @@ Before any request arrives, `BatchedModel.__init__` calls:
 self.model = Qwen3ForCausalLM.from_pretrained(model_path, dtype=torch.bfloat16)
 ```
 
-`from_pretrained` runs the five steps from section 02: `_resolve_model_path` locates the local checkpoint, `Qwen3Config.from_json` reads `config.json` into a plain dataclass (no HuggingFace machinery), `cls(config)` constructs the full architecture on CPU with uninitialised weights, `.to(bfloat16)` casts all parameters before any copy happens, and `load_weights` streams tensors from `model.safetensors` one at a time via `safe_open`, writing each into the matching parameter with `params[name].data.copy_(tensor)`. After the loop, `lm_head.weight` is pointed at `embed_tokens.weight` to share memory (section 02). The model moves to CUDA and enters eval mode. Every subsequent forward call goes through code we own.
+`from_pretrained` resolves the model path, reads `config.json` into our `Qwen3Config` dataclass, builds the full architecture on CPU, casts to `bfloat16`, and streams weights from `model.safetensors` one tensor at a time into each parameter. The `lm_head` and `embed_tokens` weights share memory via the tie. These steps are covered in Layer 4A; they carry over to Layer 4B unchanged. Every subsequent forward call goes through code we own.
 
 ---
 
@@ -54,9 +54,9 @@ for layer in self.layers:                             # 28 ×
     hidden = layer(hidden, cos, sin, additive_mask, kv)
 ```
 
-`embed_tokens` maps each token ID to a 1024-dimensional vector. `RotaryEmbedding` (section 04) computes `cos` and `sin` once from `prefill_pos` — the outer product of `inv_freq [64]` with the position indices gives `freqs [B, max_prompt_len, 64]`, doubled to `[B, max_prompt_len, 128]`, then `.cos()` and `.sin()`. `_build_additive_mask` (section 05) constructs the `[B, 1, max_prompt_len, max_prompt_len]` mask combining upper-triangular `NEG_INF` for future positions and `NEG_INF` for padding positions.
+`embed_tokens` maps each token ID to a 1024-dimensional vector. `RotaryEmbedding` (section 03) computes `cos` and `sin` once from `prefill_pos` — the outer product of `inv_freq [64]` with the position indices gives `freqs [B, max_prompt_len, 64]`, doubled to `[B, max_prompt_len, 128]`, then `.cos()` and `.sin()`. `_build_additive_mask` (section 04) constructs the `[B, 1, max_prompt_len, max_prompt_len]` mask combining upper-triangular `NEG_INF` for future positions and `NEG_INF` for padding positions.
 
-Each of the 28 `Qwen3DecoderLayer` blocks (section 03) applies pre-norm with `input_layernorm`, then calls `Qwen3Attention` (section 06). Inside attention: `q_proj/k_proj/v_proj` project to `[B, max_prompt_len, 16, 128]` and `[B, max_prompt_len, 8, 128]` respectively; `q_norm` and `k_norm` (per-head RMSNorm, section 03) normalise each head's Q and K; after transposing to `[B, heads, max_prompt_len, 128]`, `apply_rotary_pos_emb` (section 04) encodes position via `q_rot = q*cos + rotate_half(q)*sin`; `kv.update(layer_idx, k, v)` appends K and V to the cache and returns the full accumulated tensors; `repeat_kv` expands K and V from 8 heads to 16 without copying; `F.scaled_dot_product_attention` computes `softmax(Q·Kᵀ/√128 + mask)·V`, dispatching to FlashAttention on CUDA. The decoder block then adds the attention residual, normalises with `post_attention_layernorm`, runs the SwiGLU MLP (`gate_proj` + `up_proj` gated through `silu`, projected down with `down_proj`, section 03), and adds the MLP residual.
+Each of the 28 `Qwen3DecoderLayer` blocks (section 02) applies pre-norm with `input_layernorm`, then calls `Qwen3Attention` (section 05). Inside attention: `q_proj/k_proj/v_proj` project to `[B, max_prompt_len, 16, 128]` and `[B, max_prompt_len, 8, 128]` respectively; `q_norm` and `k_norm` (per-head RMSNorm, section 02) normalise each head's Q and K; after transposing to `[B, heads, max_prompt_len, 128]`, `apply_rotary_pos_emb` (section 03) encodes position via `q_rot = q*cos + rotate_half(q)*sin`; `kv.update(layer_idx, k, v)` appends K and V to the cache and returns the full accumulated tensors; `repeat_kv` expands K and V from 8 heads to 16 without copying; `F.scaled_dot_product_attention` computes `softmax(Q·Kᵀ/√128 + mask)·V`, dispatching to FlashAttention on CUDA. The decoder block then adds the attention residual, normalises with `post_attention_layernorm`, runs the SwiGLU MLP (`gate_proj` + `up_proj` gated through `silu`, projected down with `down_proj`, section 02), and adds the MLP residual.
 
 After all 28 layers, `model.norm` (final RMSNorm) normalises `hidden [B, max_prompt_len, 1024]`, and `lm_head` projects to `logits [B, max_prompt_len, vocab_size]`. Back in `model_runner.py`:
 
@@ -98,7 +98,7 @@ for _ in range(max_new_tokens - 1):
 
 On each step, finished requests have their input token replaced with `pad_id` via `torch.where` — their row stays in the batch at shape `[B, 1]` but produces no meaningful output. `attention_mask` grows by one column per step, keeping the mask shape consistent with the growing KV cache. `decode_pos [B, 1]` gives each request its own absolute position (`prompt_lens[i] + decode_step`) rather than a shared offset, ensuring correct RoPE encoding for sequences of different lengths (section 04).
 
-The forward call is identical to the prefill call but with `q_len = 1`. Inside `Qwen3Model.forward`, `cos` and `sin` are `[B, 1, 128]`; `_build_additive_mask` produces a `[B, 1, 1, kv_len]` mask where the causal part is all-zeros (no future positions to mask for a single query token — section 05); `kv.update(layer_idx, k, v)` appends one new K/V row per layer to the cache; `repeat_kv` and SDPA run as before. `logits[:, -1, :]` is `logits[:, 0, :]` since `q_len = 1`, and `sample_batch` draws the next `[B]` tokens. `finished` accumulates with `|=` and the loop exits early when all requests have emitted EOS.
+The forward call is identical to the prefill call but with `q_len = 1`. Inside `Qwen3Model.forward`, `cos` and `sin` are `[B, 1, 128]`; `_build_additive_mask` produces a `[B, 1, 1, kv_len]` mask where the causal part is all-zeros (no future positions to mask for a single query token — section 04); `kv.update(layer_idx, k, v)` appends one new K/V row per layer to the cache; `repeat_kv` and SDPA run as before. `logits[:, -1, :]` is `logits[:, 0, :]` since `q_len = 1`, and `sample_batch` draws the next `[B]` tokens. `finished` accumulates with `|=` and the loop exits early when all requests have emitted EOS.
 
 ---
 
