@@ -1,0 +1,40 @@
+# Layer 0 — Naive Inference Server Configuration
+# ------------------------------------------------
+# Mirrors sglang's --config pattern (server_args_config_parser.py):
+#   CLI args  >  this file  >  Python hardcoded defaults
+#
+# Usage:
+#   python server.py                        # loads this file automatically
+#   python server.py --config config.yml    # explicit (same result)
+#   python server.py --port 8200            # overrides just the port; rest from here
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+model: Qwen/Qwen3-0.6B
+dtype: bfloat16     # weight dtype loaded onto the GPU (bfloat16 halves memory vs float32)
+device: cuda
+
+# ---------------------------------------------------------------------------
+# Server
+# ---------------------------------------------------------------------------
+host: "0.0.0.0"
+port: 8100
+log_level: warning  # uvicorn access-log verbosity
+
+# ---------------------------------------------------------------------------
+# Generation behaviour
+# The defining Layer 0 choice: use_cache=false means every decode step
+# recomputes K and V for ALL prior tokens from scratch (O(n^2) attention).
+# Flip to true here (or with --use-cache) to preview the Layer 1 speedup.
+# ---------------------------------------------------------------------------
+use_cache: false
+max_new_tokens: 64   # default when the request does not specify
+temperature: 1.0
+
+# ---------------------------------------------------------------------------
+# Benchmark (benchmark.py)
+# ---------------------------------------------------------------------------
+benchmark_num_requests: 20
+benchmark_max_new_tokens: 128
+benchmark_seed: 42

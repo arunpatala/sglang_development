@@ -1,0 +1,7 @@
+# 07 — What Comes Next
+
+Layer 0 has given you the full, unadorned picture: a model loaded once, a chat template applied, tokens generated one at a time, responses returned sequentially, and a benchmark that puts a concrete number — 114 tok/s, 1418 ms average latency — on the cost of doing things this simply. Everything that follows is a targeted improvement on one of the things this layer makes visible.
+
+Layer 1 speeds up the generate loop itself by introducing an optimisation inside the model that avoids redundant computation on every decode step. Layer 2 introduces batching: instead of running one sequence through the GPU at a time, multiple sequences are packed into a single forward pass, keeping the GPU's parallel compute units occupied. Layer 3 adds an async request queue so that newly arrived requests do not have to wait for the current one to finish before being picked up. Later layers go further — managing memory more carefully, caching repeated computation across requests, and eventually quantising the model weights to fit more throughput into the same hardware.
+
+Each of those improvements is independently measurable with `benchmark.py`. The dataset, the seed, the hardware, and the token counts stay constant across layers; only the server changes. By the end of the curriculum you will have watched a 114 tok/s baseline grow considerably, and you will understand exactly why each step moved the number.

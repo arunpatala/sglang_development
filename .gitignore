@@ -1,5 +1,6 @@
 # External repositories — not part of this project
 REPOS/
+.env
 
 # Python
 __pycache__/
