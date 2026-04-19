@@ -1,0 +1,42 @@
+# Layer 3 — Static Batching Configuration
+# -----------------------------------------
+# Mirrors sglang's --config pattern (server_args_config_parser.py):
+#   CLI args  >  this file  >  Python hardcoded defaults
+#
+# Usage:
+#   python server.py                        # loads this file automatically
+#   python server.py --config config.yml    # explicit (same result)
+#   python server.py --port 8200            # overrides just the port; rest from here
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+model: Qwen/Qwen3-0.6B
+dtype: bfloat16     # weight dtype loaded onto the GPU (bfloat16 halves memory vs float32)
+device: cuda
+
+# ---------------------------------------------------------------------------
+# Server
+# ---------------------------------------------------------------------------
+host: "0.0.0.0"
+port: 8103
+log_level: warning  # uvicorn access-log verbosity
+
+# ---------------------------------------------------------------------------
+# Generation behaviour
+# Layer 3 processes B requests in a single batched forward pass.
+# Prefill: [B, max_prompt_len] — all prompts padded to the same length.
+# Decode:  [B, 1]             — one new token per request per step.
+# GPU utilisation climbs toward 100% as batch_size increases.
+# ---------------------------------------------------------------------------
+max_new_tokens: 128  # default when the request does not specify
+temperature: 1.0
+
+# ---------------------------------------------------------------------------
+# Benchmark (benchmark.py)
+# The benchmark sweeps over multiple batch sizes to show the throughput curve.
+# ---------------------------------------------------------------------------
+benchmark_num_requests: 20
+benchmark_max_new_tokens: 128
+benchmark_seed: 42
+benchmark_batch_sizes: [1, 4, 8, 16, 20]

@@ -33,6 +33,7 @@ import torch
 from transformers import AutoModelForCausalLM
 
 from kv_cache import KVCache
+from sampling import sample_batch
 from tokenizer import Tokenizer
 
 logger = logging.getLogger(__name__)
@@ -58,22 +59,6 @@ class BatchedKVCacheModel:
         logger.info(
             f"GPU memory after load: {torch.cuda.memory_allocated() / 1024**2:.0f} MB"
         )
-
-    # ------------------------------------------------------------------
-    # Sampling
-    # ------------------------------------------------------------------
-
-    def _sample_batch(
-        self,
-        logits: torch.Tensor,   # [B, vocab_size]
-        temperature: float,
-    ) -> torch.Tensor:           # [B]
-        if temperature == 0.0:
-            return logits.argmax(dim=-1)
-        if temperature != 1.0:
-            logits = logits / temperature
-        probs = torch.softmax(logits, dim=-1)
-        return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
     # ------------------------------------------------------------------
     # Single request (identical to Layer 2, for /generate endpoint)
@@ -153,7 +138,7 @@ class BatchedKVCacheModel:
         # Sample the first token for each request from the last position's logits.
         # out.logits shape: [B, max_prompt_len, vocab_size]
         # We take [:, -1, :] — the prediction at the last position of each row.
-        next_tokens = self._sample_batch(out.logits[:, -1, :], temperature)  # [B]
+        next_tokens = sample_batch(out.logits[:, -1, :], temperature)  # [B]
 
         # --- Step 4: decode loop ---
         # finished[i] = True once request i has emitted <eos>
@@ -204,7 +189,7 @@ class BatchedKVCacheModel:
                 )
 
             past_kv = out.past_key_values
-            next_tokens = self._sample_batch(out.logits[:, -1, :], temperature)  # [B]
+            next_tokens = sample_batch(out.logits[:, -1, :], temperature)  # [B]
             step_times.append(time.perf_counter() - t_step)
 
             newly_finished = next_tokens == self.eos_id
