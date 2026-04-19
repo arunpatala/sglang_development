@@ -1,64 +1,65 @@
 """
-Layer 8 — KV Cache: paged pool + req_to_token GPU table.
+Layer 9 — KV Cache: ReqToTokenPool + variable page_size.
 
-Builds on Layer 7 (KVPool + per-step context objects) by adding:
+Extends Layer 8 (paged pool, page_size=1) with two improvements applied
+together:
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-ReqToTokenPool  (one global instance, lives for the server's lifetime)
+ReqToTokenPool  (new global GPU table)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-A 2D GPU int32 tensor  [max_batch, max_context_len]  that mirrors SGLang's
-own ReqToTokenPool (mem_cache/memory_pool.py).
+A 2D GPU int32 tensor  [max_batch, max_pages_per_req]  that mirrors SGLang's
+ReqToTokenPool (srt/mem_cache/memory_pool.py).
 
-    req_to_token[req_pool_idx, token_pos] = physical_slot
+    req_to_token[req_pool_idx, page_pos] = physical_page_idx
 
-This table is the source of truth for the Triton kernel.  Every slot index
+This table is the source of truth for the Triton kernel.  Every page index
 that exists in req.slot_indices is also written here at the same time, so
-the kernel can read them on-device without any Python-loop iteration.
-
-The pool manages row indices with a free list (same pattern as KVPool):
-    free_slots: List[int]  ← which rows are available
-    alloc() → int           ← returns a row index, called once at prefill
-    free(idx)               ← returns the row, called on request finish
+the kernel can read them on-device without any Python-loop iteration or
+CPU→GPU copy of page data.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-KVPool  (unchanged from Layer 7)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    k_pool[layer]:  [total_slots, n_kv_heads, head_dim]   dtype=bfloat16
-    v_pool[layer]:  [total_slots, n_kv_heads, head_dim]
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-PrefillKVCtx  (unchanged from Layer 7)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Writes prompt K/V to the KVPool.  model_runner.prefill() separately writes
-the slot indices to req_to_token[req_pool_idx, 0:L] before calling forward.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-DecodeKVCtx  (unchanged from Layer 7)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Carries the FlashInfer wrapper + pool references + new_slots.
-model_runner.decode_step() writes new slots to req_to_token then calls
-the Triton kernel to build kv_indices on-GPU before calling begin_forward.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-What changed from Layer 7
+KVPool — shape changes with page_size
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  Layer 7                             Layer 8
-  ──────────────────────              ────────────────────────────────────
-  kv_indices built in Python          Triton kernel builds kv_indices on GPU
-    for req in reqs:                    one threadblock per request, parallel
-      list.extend(req.slot_indices)     reads req_to_token[row, :] on-device
-  torch.tensor(list) — CPU→GPU copy  NO copy of slot data CPU→GPU each step
-  kv_indptr via itertools.accumulate  kv_indptr via torch.cumsum on GPU
-  No req_to_token table               req_to_token pre-allocated on GPU
+  Layer 8 (page_size=1)               Layer 9 (page_size=P)
+  ─────────────────────────────────   ─────────────────────────────────────
+  KVPool shape: [slots, n_kv, D]      KVPool shape: [pages, P, n_kv, D]
+  alloc(n_tokens) → n_tokens slots    alloc(n_tokens) → ceil(n/P) pages
+  kv_indices = one int per token      kv_indices = one int per page
+  kv_last_page_lens = all ones        kv_last_page_lens = 1..P (variable)
+  New slot per decode step always     New page only when page fills up
+  pool[layer][slot_t] = k_token       pool[layer][page, offset] = k_token
+  req_to_token col = token pos        req_to_token col = page pos
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PrefillKVCtx.store()
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  k shape from attention: [1, n_kv, prompt_len, head_dim]
+  1. Permute → [prompt_len, n_kv, head_dim]
+  2. Pad to multiple of page_size (zeros in unused slots of last page —
+     never read because kv_last_page_lens tells FlashInfer the true fill level)
+  3. View → [num_pages, page_size, n_kv, head_dim]
+  4. Scatter-write: k_pool[layer][page_indices] = k_paged
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DecodeKVCtx.store()
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  k_fi shape: [B, n_kv, head_dim]  (one new token per request)
+  Write: k_pool[layer][last_page_indices, token_offsets] = k_fi
+    last_page_indices: [B] — the page where the new token lands
+    token_offsets:     [B] — position within that page (seq_len % page_size)
+
+  Replaces Layer 8's single new_slots [B] index with a 2D (page, offset) pair.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import List, Optional
+import math
+from typing import List
 
 import torch
+import torch.nn.functional as F
 import flashinfer
 
 logger = logging.getLogger(__name__)
@@ -67,33 +68,32 @@ DEVICE = "cuda"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ReqToTokenPool — GPU-resident request → slot lookup table
+# ReqToTokenPool — GPU-resident request → page lookup table
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ReqToTokenPool:
     """
-    2D GPU int32 table: req_to_token[req_pool_idx, token_pos] = slot_idx.
+    2D GPU int32 table: req_to_token[req_pool_idx, page_pos] = page_idx.
 
-    Mirrors SGLang's ReqToTokenPool (mem_cache/memory_pool.py lines 140-155).
+    Mirrors SGLang's ReqToTokenPool (srt/mem_cache/memory_pool.py).
 
     Allocated once at startup.  Each active request owns one row (req_pool_idx).
     The Triton kernel reads rows directly on-device to build kv_indices without
-    any Python iteration or CPU→GPU copy of slot data.
+    any Python iteration or CPU→GPU copy of page data.
 
     Row ownership:
       alloc()  → pop a row index (called once per request at prefill)
       free(i)  → return the row index (called when request finishes)
 
-    Writes are done externally (in model_runner) via direct tensor indexing:
-      At prefill:    req_to_token[idx, 0:L]         = slot_indices_tensor
-      At each decode: req_to_token[indices, seq_lens] = new_slots_tensor   (batch)
+    Writes are done externally (in model_runner):
+      At prefill:    req_to_token[idx, 0:n_pages]           = page_indices_tensor
+      When page fills: req_to_token[idx, num_pages]          = new_page_idx (scalar)
     """
 
     def __init__(self, max_batch: int, max_context_len: int) -> None:
         self.max_batch       = max_batch
         self.max_context_len = max_context_len
 
-        # Shape: [max_batch, max_context_len]  int32  on GPU
         self.req_to_token = torch.zeros(
             (max_batch, max_context_len), dtype=torch.int32, device=DEVICE
         )
@@ -120,69 +120,83 @@ class ReqToTokenPool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# KVPool — the global pre-allocated token store
+# KVPool — pre-allocated paged token store
 # ─────────────────────────────────────────────────────────────────────────────
 
 class KVPool:
     """
-    Pre-allocated flat GPU token store.  Slot 0 is reserved as a dummy
-    padding slot (FlashInfer convention); real tokens start at slot 1.
+    Pre-allocated GPU KV store with configurable page_size.
+
+    Shape per layer:  [total_pages, page_size, n_kv_heads, head_dim]
+    Page 0 is reserved as a zero-filled padding page (FlashInfer convention).
+    Real pages start at index 1.
+
+    alloc(n_tokens) pops ceil(n_tokens / page_size) pages from free_slots.
+    free(page_indices) pushes them back.
     """
 
     def __init__(
         self,
-        total_slots: int,
+        total_pages: int,
+        page_size: int,
         n_layers: int,
         n_kv_heads: int,
         head_dim: int,
         dtype: torch.dtype,
     ) -> None:
-        self.total_slots = total_slots
+        self.total_pages = total_pages
+        self.page_size   = page_size
         self.n_layers    = n_layers
         self.n_kv_heads  = n_kv_heads
         self.head_dim    = head_dim
         self.dtype       = dtype
 
-        # One flat tensor per layer for K and V.
-        # Shape: [total_slots, n_kv_heads, head_dim]
-        # Slot 0 is left as zeros — used as dummy by FlashInfer padding.
+        # Shape: [total_pages, page_size, n_kv_heads, head_dim]
+        # Page 0 left as zeros — used as dummy padding by FlashInfer.
         self.k_pool: List[torch.Tensor] = [
-            torch.zeros(total_slots, n_kv_heads, head_dim, dtype=dtype, device=DEVICE)
+            torch.zeros(total_pages, page_size, n_kv_heads, head_dim,
+                        dtype=dtype, device=DEVICE)
             for _ in range(n_layers)
         ]
         self.v_pool: List[torch.Tensor] = [
-            torch.zeros(total_slots, n_kv_heads, head_dim, dtype=dtype, device=DEVICE)
+            torch.zeros(total_pages, page_size, n_kv_heads, head_dim,
+                        dtype=dtype, device=DEVICE)
             for _ in range(n_layers)
         ]
 
-        # Slot 0 reserved; real slots start at 1.
-        self.free_slots: List[int] = list(range(1, total_slots))
+        # Page 0 reserved; real pages start at 1.
+        self.free_slots: List[int] = list(range(1, total_pages))
 
         mem_gb = (
-            n_layers * 2 * total_slots * n_kv_heads * head_dim
+            n_layers * 2 * total_pages * page_size * n_kv_heads * head_dim
             * torch.finfo(dtype).bits // 8
         ) / (1024 ** 3)
         logger.info(
-            f"KVPool: {total_slots} slots × {n_layers} layers "
+            f"KVPool: {total_pages} pages × page_size={page_size} × {n_layers} layers "
             f"= {mem_gb:.2f} GB  (n_kv={n_kv_heads}, dim={head_dim})"
         )
 
     def available(self) -> int:
         return len(self.free_slots)
 
-    def alloc(self, n: int) -> List[int]:
-        """Pop n slots from the free list.  Raises if pool is exhausted."""
-        if n > len(self.free_slots):
-            raise RuntimeError(
-                f"KVPool OOM: need {n} slots, only {len(self.free_slots)} free"
-            )
-        slots = self.free_slots[:n]
-        self.free_slots = self.free_slots[n:]
-        return slots
+    def n_pages_for(self, n_tokens: int) -> int:
+        return math.ceil(n_tokens / self.page_size)
 
-    def free(self, slots: List[int]) -> None:
-        """Return slots to the free list."""
-        self.free_slots.extend(slots)
+    def alloc(self, n_tokens: int) -> List[int]:
+        """Allocate ceil(n_tokens / page_size) pages. Returns page indices."""
+        n_pages = self.n_pages_for(n_tokens)
+        if n_pages > len(self.free_slots):
+            raise RuntimeError(
+                f"KVPool OOM: need {n_pages} pages for {n_tokens} tokens, "
+                f"only {len(self.free_slots)} pages free"
+            )
+        pages = self.free_slots[:n_pages]
+        self.free_slots = self.free_slots[n_pages:]
+        return pages
+
+    def free(self, page_indices: List[int]) -> None:
+        """Return page indices to the free list."""
+        self.free_slots.extend(page_indices)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -191,39 +205,52 @@ class KVPool:
 
 class PrefillKVCtx:
     """
-    Context object for prefill.  Detected by hasattr(kv_cache, 'prefill_slots').
+    Context for prefill.  Detected by hasattr(kv_cache, 'prefill_slots').
 
-    Carries the pool slot indices for this request's prompt tokens.
-    attention.py calls store() after computing K/V to persist them to the pool.
-    Attention itself (F.sdpa) runs over the freshly computed K/V, not the pool.
+    page_indices: list of page indices allocated for this request's prompt.
+    store() writes the prompt K/V into the paged pool.
+    Attention itself uses F.sdpa over the fresh K/V — pool write is a side-effect.
     """
 
-    def __init__(self, slot_indices: List[int], kv_pool: KVPool) -> None:
-        # Duck-typing marker recognised by attention.py
-        self.prefill_slots = slot_indices
-
-        self._kv_pool = kv_pool
-        # Tensor version for fancy-indexed pool writes (avoid repeated conversion)
-        self._slot_t  = torch.tensor(slot_indices, dtype=torch.int64, device=DEVICE)
+    def __init__(self, page_indices: List[int], kv_pool: KVPool) -> None:
+        self.prefill_slots = page_indices   # duck-typing marker
+        self._kv_pool      = kv_pool
+        self._page_t       = torch.tensor(page_indices, dtype=torch.int64, device=DEVICE)
+        self._n_pages      = len(page_indices)
 
     def get_seq_length(self) -> int:
-        """No past KV during prefill; position_ids are passed explicitly."""
         return 0
 
     def store(self, layer_idx: int, k: torch.Tensor, v: torch.Tensor) -> None:
         """
-        Write prompt K/V into the global pool.
+        Write prompt K/V into the paged pool.
 
-        k shape: [1, n_kv_heads, prompt_len, head_dim]  (from attention.py)
-        Pool row: [n_kv_heads, head_dim]  per slot
+        k shape from attention: [1, n_kv_heads, prompt_len, head_dim]
 
-        Convert k → [prompt_len, n_kv_heads, head_dim] then scatter into slots.
+        Steps:
+          1. [1, n_kv, L, D] → [L, n_kv, D]
+          2. Pad L to n_pages * page_size (zero-fill unused slots in last page)
+          3. View → [n_pages, page_size, n_kv, D]
+          4. Scatter-write into pool: k_pool[layer][page_indices] = k_paged
         """
-        # [1, n_kv, L, D] → [L, n_kv, D]
-        k_nhd = k.squeeze(0).permute(1, 0, 2).contiguous()
+        P   = self._kv_pool.page_size
+        L   = k.shape[2]
+
+        k_nhd = k.squeeze(0).permute(1, 0, 2).contiguous()   # [L, n_kv, D]
         v_nhd = v.squeeze(0).permute(1, 0, 2).contiguous()
-        self._kv_pool.k_pool[layer_idx][self._slot_t] = k_nhd
-        self._kv_pool.v_pool[layer_idx][self._slot_t] = v_nhd
+
+        pad = self._n_pages * P - L
+        if pad > 0:
+            k_nhd = F.pad(k_nhd, (0, 0, 0, 0, 0, pad))
+            v_nhd = F.pad(v_nhd, (0, 0, 0, 0, 0, pad))
+
+        n_kv = self._kv_pool.n_kv_heads
+        D    = self._kv_pool.head_dim
+        k_paged = k_nhd.view(self._n_pages, P, n_kv, D)
+        v_paged = v_nhd.view(self._n_pages, P, n_kv, D)
+
+        self._kv_pool.k_pool[layer_idx][self._page_t] = k_paged
+        self._kv_pool.v_pool[layer_idx][self._page_t] = v_paged
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -232,18 +259,18 @@ class PrefillKVCtx:
 
 class DecodeKVCtx:
     """
-    Context object for batched decode.  Detected by hasattr(kv_cache, 'wrapper').
+    Context for batched decode.  Detected by hasattr(kv_cache, 'wrapper').
 
-    Carries:
-      wrapper    — FlashInfer BatchDecodeWithPagedKVCacheWrapper, already planned
-      k_pool     — reference to the global K pool (FlashInfer reads it directly)
-      v_pool     — reference to the global V pool
-      new_slots  — [B] tensor of fresh slot indices (one per request)
-                   each attention layer writes the new decode token here
+    last_page_indices: [B] int64 — the page where each request's new token lands
+                         (either a freshly allocated page or the existing last page)
+    token_offsets:     [B] int64 — seq_len % page_size for each request
+                         (position within that page)
 
-    attention.py calls store() to write the new token, then calls
-    wrapper.forward() which reads the entire pool slice for each request
-    via kv_indices (set during begin_forward in model_runner).
+    store() writes k_fi/v_fi into pool[layer][last_page_indices, token_offsets].
+    wrapper.forward() then reads the full KV history via kv_indices.
+
+    Replaces Layer 8's single new_slots [B] index with a (page, offset) pair,
+    enabling writes into partially-filled pages without allocating a new page.
     """
 
     def __init__(
@@ -251,23 +278,25 @@ class DecodeKVCtx:
         wrapper: flashinfer.BatchDecodeWithPagedKVCacheWrapper,
         k_pool: List[torch.Tensor],
         v_pool: List[torch.Tensor],
-        new_slots: torch.Tensor,       # [B] int64
+        last_page_indices: torch.Tensor,   # [B] int64
+        token_offsets: torch.Tensor,       # [B] int64
     ) -> None:
-        # Duck-typing marker recognised by attention.py
-        self.wrapper   = wrapper
-        self.k_pool    = k_pool
-        self.v_pool    = v_pool
-        self.new_slots = new_slots     # [B]
+        self.wrapper           = wrapper   # duck-typing marker
+        self.k_pool            = k_pool
+        self.v_pool            = v_pool
+        self.last_page_indices = last_page_indices
+        self.token_offsets     = token_offsets
 
     def get_seq_length(self) -> int:
-        """position_ids are passed explicitly; past_len not needed."""
         return 0
 
     def store(self, layer_idx: int, k_fi: torch.Tensor, v_fi: torch.Tensor) -> None:
         """
         Write the new decode token's K/V into the pool for each request.
 
-        k_fi shape: [B, n_kv_heads, head_dim]  (squeezed q_len=1 dim)
+        k_fi shape: [B, n_kv_heads, head_dim]
+
+        2D advanced indexing selects (page, within-page offset) per request.
         """
-        self.k_pool[layer_idx][self.new_slots] = k_fi
-        self.v_pool[layer_idx][self.new_slots] = v_fi
+        self.k_pool[layer_idx][self.last_page_indices, self.token_offsets] = k_fi
+        self.v_pool[layer_idx][self.last_page_indices, self.token_offsets] = v_fi

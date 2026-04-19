@@ -1,0 +1,59 @@
+# Layer 9 — Paged Attention (ReqToTokenPool + variable page_size) Configuration
+# -------------------------------------------------------------------------------
+# Mirrors sglang's --config pattern (server_args_config_parser.py):
+#   CLI args  >  this file  >  Python hardcoded defaults
+#
+# Usage:
+#   python server.py                              # loads this file automatically
+#   python server.py --port 8200                  # overrides just the port; rest from here
+#   python server.py --kv-memory-fraction 0.7     # smaller KV pool for debugging
+#   python server.py --page-size 32               # larger pages, fewer kv_indices entries
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+model: Qwen/Qwen3-0.6B
+dtype: bfloat16     # weight dtype loaded onto the GPU (bfloat16 halves memory vs float32)
+device: cuda
+
+# ---------------------------------------------------------------------------
+# Server
+# ---------------------------------------------------------------------------
+host: "0.0.0.0"
+port: 8109
+log_level: warning  # uvicorn access-log verbosity
+
+# ---------------------------------------------------------------------------
+# Scheduler
+# ---------------------------------------------------------------------------
+max_running: 16   # max requests in the decode batch simultaneously
+
+# ---------------------------------------------------------------------------
+# KV pool
+# kv_memory_fraction: fraction of free GPU memory (after model load) for pool.
+# Higher = more concurrent tokens; lower = leaves headroom for other tensors.
+#
+# page_size: tokens per KV pool page.
+#   page_size=1  (Layer 8 behaviour): kv_indices has one entry per token.
+#   page_size=16 (default here): kv_indices has ceil(tokens/16) entries;
+#                                16× fewer index lookups per decode step.
+#   page_size=P: KVPool shape [total_pages, P, n_kv_heads, head_dim].
+#                New page allocated only when current last page fills up.
+#                kv_last_page_lens records actual fill of last page (1..P).
+# ---------------------------------------------------------------------------
+kv_memory_fraction: 0.85
+page_size: 16
+
+# ---------------------------------------------------------------------------
+# Generation behaviour
+# ---------------------------------------------------------------------------
+max_new_tokens: 128  # default when the request does not specify
+temperature: 1.0
+
+# ---------------------------------------------------------------------------
+# Benchmark (benchmark.py)
+# ---------------------------------------------------------------------------
+benchmark_num_requests: 20
+benchmark_max_new_tokens: 128
+benchmark_seed: 42
+benchmark_batch_sizes: [1, 4, 8, 16, 20]

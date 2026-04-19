@@ -14,7 +14,7 @@ every physical pool slot for every active request, laid out as:
     [slot_0_req0, slot_1_req0, ..., slot_N0_req0,
      slot_0_req1, slot_1_req1, ..., slot_N1_req1, ...]
 
-In Layer 7 this was built in Python:
+In Layer 8 (page_size=1) this was built in Python:
 
     for i, req in enumerate(reqs):
         kv_indices_list.extend(req.slot_indices)
@@ -22,17 +22,19 @@ In Layer 7 this was built in Python:
     kv_indices = torch.tensor(kv_indices_list, device='cuda')   # CPU → GPU copy
 
 Problems:
-  - Python iteration over per-request slot lists (O(Σ kv_lens) Python ops)
+  - Python iteration over per-request slot lists (O(Σ kv_tokens) Python ops)
   - Host-to-device copy of the entire index array every step
 
-Layer 8 replaces this with `create_flashinfer_kv_indices_triton`:
+Layer 9 replaces this with `create_flashinfer_kv_indices_triton`:
   - One GPU threadblock per request (all B requests in parallel)
-  - Reads directly from `req_to_token[req_pool_idx, 0:seq_len]` on GPU
+  - Reads directly from `req_to_token[req_pool_idx, 0:num_pages]` on GPU
   - Writes the flat `kv_indices` output — no Python loop, no CPU→GPU copy
+  - With page_size=P, kv_indices has Σ(num_pages) entries — P× fewer than
+    the token-level index that Layer 8 would have built.
 
 The only CPU→GPU data that moves each step is the small metadata:
     req_pool_indices  [B] int32   ← which req_to_token row per request
-    seq_lens          [B] int32   ← how many tokens each request has
+    num_pages         [B] int32   ← how many pages each request has
 Both fit in a single cache line and are unavoidable.
 """
 

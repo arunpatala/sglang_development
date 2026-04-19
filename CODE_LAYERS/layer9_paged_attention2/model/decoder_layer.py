@@ -32,16 +32,15 @@ class Qwen3DecoderLayer(nn.Module):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,          # [B, q_len, hidden]
-        cos: torch.Tensor,                    # [B, q_len, head_dim]
-        sin: torch.Tensor,                    # [B, q_len, head_dim]
-        attention_mask: torch.Tensor | None,  # [B, 1, q_len, kv_len] additive
-        kv_cache=None,                        # KVCache | None
+        hidden_states: torch.Tensor,   # [B, q_len, hidden]
+        cos:           torch.Tensor,   # [B, q_len, head_dim]
+        sin:           torch.Tensor,   # [B, q_len, head_dim]
+        forward_batch,                 # ForwardBatch
     ) -> torch.Tensor:
         # ── Self-attention sublayer ───────────────────────────────────────
         residual     = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, cos, sin, attention_mask, kv_cache)
+        hidden_states = self.self_attn(hidden_states, cos, sin, forward_batch)
         hidden_states = residual + hidden_states
 
         # ── MLP sublayer ──────────────────────────────────────────────────
