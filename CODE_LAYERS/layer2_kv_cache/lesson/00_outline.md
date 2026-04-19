@@ -58,7 +58,14 @@ The sections follow the code: we start with what changed in `model.py`, then exp
 - The attention operation in decode: the new token's query attends over all cached K/V — `O(L+k)` work instead of `O((L+k)²)`
 - Memory trade-off: TPOT drops dramatically; GPU memory usage grows with sequence length
 
-### 07 — What the Numbers Show (`07_benchmark_results.md`)
+### 07 — The Full Loop (`07_the_full_loop.md`)
+- End-to-end trace of a single `generate()` call, connecting all prior sections in order
+- Step 1 — Tokenize: apply chat template, encode to `[1, prompt_len]`, move to GPU
+- Step 2 — Prefill: empty `KVCache()`, model call populates all 28 `LayerCache` entries, first token sampled from `logits[0, -1, :]`, TTFT recorded
+- Step 3 — Decode loop: `[1, 1]` tensor each step, `LayerCache.update` appends via `torch.cat`, new query attends over full accumulated K/V at `O(L+k)` cost, EOS check, `step_times` accumulated
+- Step 4 — Decode and return: TPOT from `step_times` average, `tokenizer.decode`, result dict returned to `server.py`
+
+### 08 — What the Numbers Show (`08_benchmark_results.md`)
 - Running the benchmark: same 20 ShareGPT requests, same seed, same hardware as Layer 1
 - TTFT: unchanged — prefill is the same `O(L²)` computation
 - TPOT: near-constant regardless of prompt length — each decode step processes one query token
@@ -66,7 +73,7 @@ The sections follow the code: we start with what changed in `model.py`, then exp
 - Memory cost per request from the server log
 - Comparison table: Layer 1 vs Layer 2 TTFT and TPOT
 
-### 08 — What Comes Next (`08_whats_next.md`)
+### 09 — What Comes Next (`09_whats_next.md`)
 - The remaining cost: `torch.cat` in `LayerCache.update` allocates a new tensor every decode step
 - Layer 3: pre-allocated fixed buffer, written in-place — no allocation, no copy
 - `server.py` and `benchmark.py` stay unchanged again — the improvement is isolated to `kv_cache.py`

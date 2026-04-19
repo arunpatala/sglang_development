@@ -114,6 +114,20 @@ TTFT does not improve. The prefill pass still processes the full prompt and stil
 
 ---
 
+## The Full Loop
+
+Now that all the parts have been explained, it is worth tracing a single `generate()` call from end to end to see how they connect.
+
+The call arrives with a list of messages. The tokenizer applies the chat template and encodes the result into `input_ids` of shape `[1, prompt_len]`, which is moved to the GPU.
+
+Prefill runs first. An empty `KVCache()` is created and passed to the model alongside the full prompt. As each of the 28 attention layers processes the prompt tokens, it calls `past_kv.update(new_k, new_v, layer_idx)`, storing the key and value tensors for every prompt token at every layer. By the time the model returns, the cache holds `[1, 8, prompt_len, 128]` tensors for all 28 layers. `out.logits[0, -1, :]` extracts the last-position logit vector, `sample_next_token` draws the first generated token, and TTFT is recorded. The first token is available before the decode loop even starts.
+
+The decode loop then runs one step at a time. Each step wraps the most recently sampled token into a `[1, 1]` tensor and calls the model with `past_key_values=past_kv`. Inside the forward pass, each attention layer computes fresh K and V for this single new token, appends them to the cache via `past_kv.update`, and attends the new token's query against the full accumulated K and V — covering all prompt tokens plus every previously generated token. The cache grows by one position per layer per step. `out.logits[0, -1, :]` gives the next-position logit vector; `sample_next_token` draws the next token; the EOS check decides whether to continue. `step_times` records the wall time of every decode step, and its average becomes TPOT.
+
+When the loop exits — either by EOS or by reaching `max_new_tokens` — `tokenizer.decode(generated_ids, skip_special_tokens=True)` converts the accumulated token list to a string. The result dict is assembled with `text`, `prompt_tokens`, `completion_tokens`, `latency_ms`, `ttft_ms`, and `tpot_ms`, and returned to `server.py` which wraps it into a `GenerateResponse`.
+
+---
+
 ## What Comes Next
 
 The `torch.cat` inside `LayerCache.update` is the remaining inefficiency. Every decode step allocates a new tensor large enough to hold all previously stored entries plus one new row, copies the old data in, writes the new row, and frees the old tensor. For 128 decode steps across 28 layers, that is 3,584 allocation-and-copy operations. The old data does not change; it is just being moved.

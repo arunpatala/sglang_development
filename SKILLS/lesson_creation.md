@@ -230,11 +230,102 @@ Every layer lesson follows the same arc:
    Each section explains one part of the generate method (or the supporting
    file it delegates to).
 
-4. **Connect to the next layer.** The final section always points at the
+4. **Revisit and tie together.** After all the pieces have been explained
+   individually, add a "The Full Loop" section that traces the complete call
+   end to end, referencing every concept by name in execution order. This is
+   the section where the reader sees how all the pieces connect.
+
+5. **Connect to the next layer.** The final section always points at the
    remaining inefficiency and what Layer N+1 addresses.
 
 This arc appears at three levels: in the opening of `01_*.md`, in the opening
-section of `summary.md`, and implicitly in the "What Comes Next" section.
+section of `summary.md`, and implicitly in the "What Comes Next" section. The
+"Full Loop" tying section appears both as a section file (`0N_the_full_loop.md`)
+and as "The Full Loop" in `summary.md`.
+
+---
+
+## The Full Loop Section
+
+Every layer must have a "The Full Loop" section that traces one complete call
+through the generate method from first line to last. It appears:
+
+- As `0N_the_full_loop.md` — a dedicated section file placed after the last
+  concept section and before "What Comes Next".
+- As "## The Full Loop" in `summary.md` — placed after all concept sections
+  and before "## What Comes Next".
+
+### What it covers
+
+The section traces the call in execution order, using short subsection headers
+that map to the code's natural steps (e.g. "Step 1 — Tokenize",
+"Step 2 — Prefill", "Step 3 — The Decode Loop", "Step 4 — Decode and Return").
+
+Each step:
+- Shows the relevant code block (the actual lines, not pseudocode).
+- References the concept sections that explain it by name: "as section 03
+  established...", "the `cumsum` fix from section 03...", etc.
+- Explains how this step hands off to the next one.
+
+The reader should finish this section with a clear mental model of the full
+call and how all the independently explained pieces fit together.
+
+### What it does not do
+
+It does not re-explain concepts in detail — those belong in the concept
+sections. It does not introduce new ideas. It is purely a connecting narrative
+that uses every concept the reader has just learned and shows them working
+together as a coherent system.
+
+### Example structure
+
+```markdown
+# 0N — The Full Loop
+
+[One-sentence framing: now that all parts are explained, trace a call end to end.]
+
+---
+
+## Step 1 — [First phase, e.g. Tokenize]
+
+\`\`\`python
+[relevant code block]
+\`\`\`
+
+[One paragraph: what this step produces and what the next step needs from it.]
+
+---
+
+## Step 2 — [Second phase, e.g. Prefill]
+
+\`\`\`python
+[relevant code block]
+\`\`\`
+
+[One paragraph connecting to the concepts explained in sections 02–0N.]
+
+---
+
+## Step 3 — [Main loop]
+
+\`\`\`python
+[relevant code block]
+\`\`\`
+
+[One paragraph naming each mechanism (by its section) and explaining the
+handoff between steps inside the loop.]
+
+---
+
+## Step 4 — [Output]
+
+\`\`\`python
+[relevant code block]
+\`\`\`
+
+[One paragraph on what is returned, how metrics are computed, and what
+server.py receives.]
+```
 
 ---
 
@@ -247,14 +338,14 @@ lesson/
 ├── 02_[concept].md            # the new mechanism introduced by this layer
 ├── 03_[concept].md
 ├── ...
-├── 0N_benchmark_results.md    # always second-to-last: what the numbers show
+├── 0N_the_full_loop.md        # always second-to-last concept: tying everything together
 ├── 0N+1_whats_next.md         # always last: what the next layer changes
 ├── summary.md
 └── sglang_reference.md
 ```
 
-`01_the_decode_loop.md` and the final two files are fixed. The middle sections
-vary by layer.
+`01_the_decode_loop.md`, `0N_the_full_loop.md`, and `0N+1_whats_next.md` are
+fixed. The middle sections vary by layer.
 
 ---
 
@@ -268,6 +359,8 @@ Before marking a layer's lesson complete:
 - [ ] No bullet points in summary or section files
 - [ ] Section 01 opens with the "before" (Layer N-1) then "after" (Layer N) loop
 - [ ] Sections 02+ open by quoting the specific code they explain
+- [ ] `0N_the_full_loop.md` exists and traces the full call in step-by-step subsections
+- [ ] "The Full Loop" section exists in `summary.md` between the last concept section and "What Comes Next"
 - [ ] Section order matches outline order
 - [ ] "What Comes Next" (last section file and last summary section) names the
       specific file and metric that Layer N+1 changes

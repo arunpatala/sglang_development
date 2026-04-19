@@ -55,7 +55,14 @@ The sections follow the code in `generate_batch()` top to bottom, then address t
 - Why static batching cannot fix this: the batch is assembled before prefill; the padded length is fixed to the longest prompt in the batch
 - The head-of-line blocking problem: short requests must wait for the longest request in the batch to finish before results are returned
 
-### 07 — What Comes Next (`07_whats_next.md`)
+### 07 — The Full Loop (`07_the_full_loop.md`)
+- End-to-end trace of a single `generate_batch` call, connecting all prior sections in order
+- Tokenizer produces `input_ids`, `attention_mask`, `prompt_lens_list`; left-padding aligns last real token to column `-1`
+- `prefill_position_ids` corrects RoPE encoding; one batched prefill populates the KV cache and yields `next_tokens [B]`; TTFT recorded
+- Decode loop: `torch.where` pad injection, mask extension, per-request `decode_position_ids`, forward pass, `sample_batch`, `finished |=`, `finished.all()` exit
+- `tokenizer.decode_batch` converts token lists to strings; individual counts and shared timing assembled into result dicts
+
+### 08 — What Comes Next (`08_whats_next.md`)
 - The head-of-line blocking problem stated concisely: a 5-token request in a batch of 20 must wait for the longest request to finish before its result is returned
 - Continuous batching: evict finished requests from the batch mid-loop and insert new requests in their place — no request waits for others
 - What file changes: the server scheduling loop; `model.py`, `kv_cache.py`, and `tokenizer.py` are untouched
