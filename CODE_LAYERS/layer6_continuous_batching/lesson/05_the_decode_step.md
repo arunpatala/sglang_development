@@ -1,5 +1,7 @@
 # 05 — The Decode Step
 
+Step 2 of the scheduler loop calls `self.model_runner.decode_step(self._running)` on every iteration where `_running` is non-empty. This is where continuous batching happens: all currently active requests — which arrived at different times, have different prompt lengths, and have accumulated different KV histories — are processed together in a single `[B, 1]` forward pass. The four inputs built below (`last_toks`, `attn_mask`, `pos_ids`, `BatchedKVCache`) are each a direct answer to the question: how do you batch requests with ragged KV lengths?
+
 ```python
 def decode_step(self, reqs: List[Req]) -> List[Req]:
     B       = len(reqs)

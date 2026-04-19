@@ -1,5 +1,7 @@
 # 03 — Per-Request KV Cache
 
+The decode step (section 05) needs a single rectangular `[B, heads, kv_len, dim]` tensor for `F.sdpa`, but every request in `_running` has accumulated a different amount of KV history because they arrived and were prefilled at different times. Layer 6 solves this with two complementary classes: `PerReqKVCache` stores each request's history independently, and `BatchedKVCache` temporarily pads and stacks those histories into the rectangular shape the model requires for one forward pass.
+
 Layer 6 introduces two KV cache classes: `PerReqKVCache` and `BatchedKVCache`. They solve complementary problems. `PerReqKVCache` gives every request its own independently-growing store of accumulated key and value tensors. `BatchedKVCache` temporarily packs those stores into a rectangular tensor so that a single batched forward pass can process all active requests at once. Understanding why both are needed requires understanding why the Layer 5 single-class design breaks down when requests have different lengths.
 
 ---

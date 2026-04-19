@@ -1,5 +1,7 @@
 # 02 — The Request
 
+Continuous batching works because requests can enter and exit the decode batch independently. That independence requires each request to carry all of its own state — the scheduler moves it from `_waiting` to `_running` to resolved without any shared variables. The `Req` dataclass is that portable unit of state: every component (`prefill`, `decode_step`, `_resolve`) takes a `Req`, reads from it, and mutates it in place.
+
 ```python
 @dataclass
 class Req:

@@ -179,6 +179,22 @@ Every section after 01 opens by quoting the specific lines it explains. Do not
 open with abstract explanation and then show code — show the code and explain
 it. The pattern is: quote the code block, then explain it in prose below.
 
+**Tie each section to the full feature in one orientation paragraph.**
+Before the code anchor (or immediately after the title), add a short paragraph
+— two to four sentences — that names where this piece lives in the full system
+loop and why the system needs it. The reader should know, at a glance, which
+step of the scheduler or generate loop this section explains and what breaks if
+this piece is missing. This paragraph is not the detailed explanation; it is the
+hook that prevents the section from reading as an isolated component description.
+
+Example (for a section explaining `PerReqKVCache`):
+> The decode step needs a single rectangular `[B, heads, kv_len, dim]` tensor
+> for `F.sdpa`, but every request in `_running` has accumulated a different
+> amount of KV history because they arrived at different times. `PerReqKVCache`
+> stores each request's history independently; `BatchedKVCache` temporarily
+> pads and stacks those histories into the rectangular shape the forward pass
+> requires.
+
 Example opening for section 04 (explaining `past_key_values`):
 ```markdown
 The decode loop in section 01 contains a line that appears after every model call:
@@ -359,6 +375,7 @@ Before marking a layer's lesson complete:
 - [ ] No bullet points in summary or section files
 - [ ] Section 01 opens with the "before" (Layer N-1) then "after" (Layer N) loop
 - [ ] Sections 02+ open by quoting the specific code they explain
+- [ ] Sections 02+ have a short orientation paragraph tying the section to the full system loop
 - [ ] `0N_the_full_loop.md` exists and traces the full call in step-by-step subsections
 - [ ] "The Full Loop" section exists in `summary.md` between the last concept section and "What Comes Next"
 - [ ] Section order matches outline order

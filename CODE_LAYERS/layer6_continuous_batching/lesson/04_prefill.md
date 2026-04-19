@@ -1,5 +1,7 @@
 # 04 — Prefill
 
+In the scheduler loop, Step 1 calls `self.model_runner.prefill(req)` before a request is ever added to `_running`. Prefill is the admission gate: it populates `req.kv_cache` with the prompt's full KV history and samples the first output token, so that by the time a request joins the decode batch, its per-request cache is already initialised and its `kv_cache.get_seq_length()` returns a valid position. No request participates in a batched decode step until this has happened.
+
 ```python
 def prefill(self, req: Req) -> None:
     ids  = torch.tensor([req.input_ids], device=DEVICE)        # [1, L]

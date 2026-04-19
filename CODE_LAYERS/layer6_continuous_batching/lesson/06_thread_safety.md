@@ -1,5 +1,7 @@
 # 06 — Thread Safety
 
+GPU computation is synchronous and blocking — it cannot be interleaved with asyncio's cooperative switching. The scheduler therefore runs on a dedicated background thread, leaving the asyncio event loop free to handle incoming HTTP connections without stalling. That design choice makes thread safety a hard requirement: the two threads must communicate without corrupting each other's state. Layer 6 enforces this through exactly two primitives: `queue.Queue` for passing requests from the HTTP handler to the scheduler, and `loop.call_soon_threadsafe` for passing results back.
+
 Layer 6 is the first layer in this series to use more than one thread. The FastAPI server runs an asyncio event loop on the main thread, handling HTTP connections with coroutine-based concurrency. The scheduler runs its `while True` loop on a background daemon thread, driving GPU computation. These two threads share exactly two pieces of state: `queue.Queue` and `asyncio.Future`. The design ensures they never share anything else.
 
 ---
