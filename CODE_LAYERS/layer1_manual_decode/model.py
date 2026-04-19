@@ -15,14 +15,17 @@ The loop:
 This is identical in computation to Layer 0 (use_cache=False). Same O(seq²)
 cost. But now we own the loop, so Layer 2 can add KV cache with a surgical
 change inside this file alone — server.py stays untouched.
+
+Sampling logic lives in sampling.py so this file stays focused on the loop.
 """
 
 import logging
 import time
-from typing import Optional
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from sampling import sample_next_token
 
 logger = logging.getLogger(__name__)
 
@@ -60,31 +63,6 @@ class NaiveModel:
         logger.info(
             f"GPU memory after load: {torch.cuda.memory_allocated() / 1024**2:.0f} MB"
         )
-
-    # ------------------------------------------------------------------
-    # Sampling helper
-    # ------------------------------------------------------------------
-
-    def _sample_next_token(
-        self,
-        logits: torch.Tensor,   # shape: [vocab_size]
-        temperature: float,
-    ) -> int:
-        """
-        Convert logits to a token id.
-
-        temperature=1.0  → multinomial sampling (no scaling)
-        temperature=0.0  → greedy (argmax)
-        otherwise        → scale logits then sample
-        """
-        if temperature == 0.0:
-            return int(logits.argmax(dim=-1).item())
-
-        if temperature != 1.0:
-            logits = logits / temperature
-
-        probs = torch.softmax(logits, dim=-1)
-        return int(torch.multinomial(probs, num_samples=1).item())
 
     # ------------------------------------------------------------------
     # Public API — called by server.py
@@ -142,7 +120,7 @@ class NaiveModel:
             # out.logits shape: [batch=1, seq_len, vocab_size]
             # We only care about the last position's prediction.
             next_token_logits = out.logits[0, -1, :]   # [vocab_size]
-            next_token_id = self._sample_next_token(next_token_logits, temperature)
+            next_token_id = sample_next_token(next_token_logits, temperature)
 
             step_times.append(time.perf_counter() - t_step)
 

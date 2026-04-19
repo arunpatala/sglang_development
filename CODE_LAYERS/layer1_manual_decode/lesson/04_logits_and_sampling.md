@@ -78,12 +78,12 @@ next_token_id = int(torch.multinomial(probs, num_samples=1).item())
 
 `torch.multinomial` draws one index from the distribution defined by `probs`. A token with probability 0.6 will be chosen 60% of the time; a token with probability 0.01 will be chosen 1% of the time. This is not argmax — it is a genuine random draw from the distribution, so different runs of the same prompt can produce different outputs.
 
-## The Complete `_sample_next_token`
+## The Complete `sample_next_token`
 
-Putting it together, the full sampling function in `model.py` handles all three cases:
+Putting it together, the full sampling function lives in `sampling.py` and handles all three cases:
 
 ```python
-def _sample_next_token(self, logits: torch.Tensor, temperature: float) -> int:
+def sample_next_token(logits: torch.Tensor, temperature: float) -> int:
     if temperature == 0.0:
         return int(logits.argmax(dim=-1).item())   # greedy
 
@@ -98,7 +98,7 @@ def _sample_next_token(self, logits: torch.Tensor, temperature: float) -> int:
 `temperature=1.0` → multinomial sample from the raw model distribution.
 Any other value → scale logits, then multinomial sample from the adjusted distribution.
 
-This function is called once per decode step, receiving `out.logits[0, -1, :]` from the forward pass and returning a single integer: the ID of the next token to append to the sequence.
+This function is called once per decode step, receiving `out.logits[0, -1, :]` from the forward pass and returning a single integer: the ID of the next token to append to the sequence. `model.py` imports it with `from sampling import sample_next_token` and calls it directly — the sampling logic is completely separate from the loop.
 
 ## Other Sampling Parameters
 
@@ -110,4 +110,4 @@ Temperature is the most fundamental sampling control, but real serving systems e
 
 **Repetition penalty** discourages the model from repeating tokens it has already generated. Logits for tokens that appear in the current sequence are divided by the penalty factor before sampling, making them less likely to be chosen again. This is a simple fix for a common failure mode where models get stuck repeating the same phrase.
 
-In this layer we implement only temperature, which is enough to make the sampling behaviour visible and controllable. Top-k, top-p, and repetition penalty are additions to `_sample_next_token` that layer on top of the same foundation — modify the logits or probabilities, then draw the sample.
+In this layer we implement only temperature, which is enough to make the sampling behaviour visible and controllable. Top-k, top-p, and repetition penalty are additions to `sample_next_token` that layer on top of the same foundation — modify the logits or probabilities, then draw the sample.

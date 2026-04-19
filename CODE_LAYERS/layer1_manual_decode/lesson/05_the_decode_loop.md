@@ -34,7 +34,7 @@ def generate(
             out = self.model(input_ids=ids, use_cache=False)
 
         next_token_logits = out.logits[0, -1, :]
-        next_token_id = self._sample_next_token(next_token_logits, temperature)
+        next_token_id = sample_next_token(next_token_logits, temperature)
 
         step_times.append(time.perf_counter() - t_step)
 
@@ -117,10 +117,10 @@ next_token_logits = out.logits[0, -1, :]
 ### Sampling
 
 ```python
-next_token_id = self._sample_next_token(next_token_logits, temperature)
+next_token_id = sample_next_token(next_token_logits, temperature)
 ```
 
-This calls the sampling function from section 04. It receives the `[vocab_size]` logit vector and returns a single integer — the token ID the model has selected as its next output. Depending on `temperature`, this is either a greedy argmax or a multinomial draw from the softmax distribution.
+This calls `sample_next_token` from `sampling.py`. It receives the `[vocab_size]` logit vector and returns a single integer — the token ID the model has selected as its next output. Depending on `temperature`, this is either a greedy argmax or a multinomial draw from the softmax distribution.
 
 ### Timing the Step
 

@@ -69,7 +69,7 @@ With a probability distribution in hand, there are two main ways to pick a token
 **Temperature sampling** draws a random sample from the distribution. Temperature controls how peaked or flat the distribution is before sampling: values below 1 make the model more confident and focused; values above 1 make it more diffuse and creative; temperature=1 leaves the distribution unchanged.
 
 ```python
-def _sample_next_token(self, logits, temperature):
+def sample_next_token(logits, temperature):           # sampling.py
     if temperature == 0.0:
         return int(logits.argmax(dim=-1).item())       # greedy
     if temperature != 1.0:
@@ -98,7 +98,7 @@ for step in range(max_new_tokens):
         out = self.model(input_ids=ids, use_cache=False)
 
     next_token_logits = out.logits[0, -1, :]
-    next_token_id = self._sample_next_token(next_token_logits, temperature)
+    next_token_id = sample_next_token(next_token_logits, temperature)
 
     step_times.append(time.perf_counter() - t_step)
 

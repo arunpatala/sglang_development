@@ -56,7 +56,7 @@ for step in range(max_new_tokens):
         out = self.model(input_ids=ids, use_cache=False)
 
     next_token_logits = out.logits[0, -1, :]
-    next_token_id = self._sample_next_token(next_token_logits, temperature)
+    next_token_id = sample_next_token(next_token_logits, temperature)
 
     step_times.append(time.perf_counter() - t_step)
     # step_times[0]  ← prefill cost (processes prompt_len tokens)

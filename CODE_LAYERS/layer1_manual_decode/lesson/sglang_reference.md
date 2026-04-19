@@ -60,7 +60,7 @@ The result is a `LogitsProcessorOutput` with a `next_token_logits` field of shap
 
 ## 4. Sampling — Greedy, Temperature, Top-k, Top-p
 
-**Layer 1:** `_sample_next_token` in `model.py` — three cases: argmax, temperature + multinomial, temperature=1 + multinomial. One request at a time.
+**Layer 1:** `sample_next_token` in `sampling.py` — three cases: argmax, temperature + multinomial, temperature=1 + multinomial. One request at a time.
 
 **SGLang:** `layers/sampler.py` — `Sampler` class (line 41), `sampling/sampling_params.py` — `SamplingParams` (line 31)
 

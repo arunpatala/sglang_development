@@ -35,13 +35,13 @@ Layer 0 called `model.generate()` and got text back. Layer 1 opens that black bo
 - Greedy decoding: `argmax` — always pick the highest-probability token, deterministic
 - Temperature: scaling logits before softmax — low temp sharpens the distribution, high temp flattens it
 - `torch.multinomial`: drawing a sample from the probability distribution
-- The `_sample_next_token` implementation in `model.py` covering all three cases
+- The `sample_next_token` implementation in `sampling.py` covering all three cases
 
 ### 05 — The Decode Loop Line by Line (`05_the_decode_loop.md`)
 - Full walkthrough of `NaiveModel.generate` in `model.py`
 - Initialise `ids = input_ids` (the prompt)
 - The `for step in range(max_new_tokens)` loop
-- Forward pass, slice `[0, -1, :]`, call `_sample_next_token`
+- Forward pass, slice `[0, -1, :]`, call `sample_next_token`
 - EOS check: stop if the model signals it is done
 - `torch.cat` to grow the sequence by one token
 - After the loop: `tokenizer.decode(generated_ids, skip_special_tokens=True)`
@@ -77,7 +77,7 @@ All lesson code references point to `model.py` in this layer:
 |---|---|
 | Model forward call | `model.py` line 140: `out = self.model(input_ids=ids, use_cache=False)` |
 | Logits slice | `model.py` line 144: `out.logits[0, -1, :]` |
-| Sampling | `model.py` lines 68–87: `_sample_next_token` |
+| Sampling | `sampling.py`: `sample_next_token` |
 | EOS check | `model.py` line 149: `if next_token_id == self.eos_id: break` |
 | Sequence growth | `model.py` line 158: `ids = torch.cat([ids, next_token_tensor], dim=1)` |
 | TTFT | `model.py` line 169: `ttft_ms = round(step_times[0] * 1000, 1)` |
