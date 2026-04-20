@@ -1,0 +1,63 @@
+# Layer 12 — Prefix Caching Configuration
+# -----------------------------------------
+# Mirrors sglang's --config pattern (server_args_config_parser.py):
+#   CLI args  >  this file  >  Python hardcoded defaults
+#
+# Usage:
+#   python server.py                                   # loads this file automatically
+#   python server.py --port 8200                       # overrides just the port
+#   python server.py --no-prefix-caching               # disable radix cache
+#   python server.py --chunked-prefill-size 512        # enable chunked prefill
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+model: Qwen/Qwen3-0.6B
+device: cuda
+
+# ---------------------------------------------------------------------------
+# Server
+# ---------------------------------------------------------------------------
+host: "0.0.0.0"
+port: 8112
+log_level: warning
+
+# ---------------------------------------------------------------------------
+# Scheduler
+# ---------------------------------------------------------------------------
+max_running: 16       # max requests in the decode batch simultaneously
+
+# ---------------------------------------------------------------------------
+# Chunked Prefill
+# chunked_prefill_size: max tokens per request per extend round (0 = disabled).
+# max_prefill_tokens:   total new-token budget across all requests per round.
+# ---------------------------------------------------------------------------
+chunked_prefill_size: 512
+max_prefill_tokens: 2048
+
+# ---------------------------------------------------------------------------
+# KV pool
+# page_size: tokens per KV page; must match compile-time constant.
+# ---------------------------------------------------------------------------
+page_size: 16
+
+# ---------------------------------------------------------------------------
+# Prefix Caching
+# Reuses KV pages for common prompt prefixes via a RadixCache (radix tree).
+# enable_prefix_caching: set to false to fall back to no-cache behaviour.
+# ---------------------------------------------------------------------------
+enable_prefix_caching: true
+
+# ---------------------------------------------------------------------------
+# Generation behaviour
+# ---------------------------------------------------------------------------
+max_new_tokens: 128
+temperature: 1.0
+
+# ---------------------------------------------------------------------------
+# Benchmark (benchmark.py)
+# ---------------------------------------------------------------------------
+benchmark_num_requests: 20
+benchmark_max_new_tokens: 128
+benchmark_seed: 42
+benchmark_batch_sizes: [1, 4, 8, 16, 20]

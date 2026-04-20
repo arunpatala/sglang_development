@@ -1,0 +1,69 @@
+# Layer 14 — Speculative Decoding Configuration
+# -----------------------------------------------
+# Mirrors sglang's --config pattern (server_args_config_parser.py):
+#   CLI args  >  this file  >  Python hardcoded defaults
+#
+# Usage:
+#   python server.py                        # fp16 target model, prefix caching on
+#   python server.py --use-gptq             # switch to GPTQ int4 model
+#   python server.py --kv-memory-fraction 0.7   # reduce KV pool for tight VRAM
+
+# ---------------------------------------------------------------------------
+# Model
+# The server uses a single target ModelRunner. The draft model and SpecRunner
+# are created separately in spec_runner.py / verify_speculative.py.
+# For GPTQ: set model: JunHowie/Qwen3-0.6B-GPTQ-Int4 and use_gptq: true
+# ---------------------------------------------------------------------------
+model: Qwen/Qwen3-0.6B
+device: cuda
+
+# ---------------------------------------------------------------------------
+# Server
+# ---------------------------------------------------------------------------
+host: "0.0.0.0"
+port: 8114
+log_level: warning
+
+# ---------------------------------------------------------------------------
+# Scheduler
+# ---------------------------------------------------------------------------
+max_running: 16
+
+# ---------------------------------------------------------------------------
+# Chunked Prefill
+# ---------------------------------------------------------------------------
+chunked_prefill_size: 512
+max_prefill_tokens: 2048
+
+# ---------------------------------------------------------------------------
+# KV pool
+# kv_memory_fraction: fraction of free GPU memory (after model load) for pool.
+# Layer 14 exposes this because speculative decoding runs two models and the
+# target's pool budget needs to be set explicitly.
+# ---------------------------------------------------------------------------
+page_size: 16
+kv_memory_fraction: 0.85
+
+# ---------------------------------------------------------------------------
+# Prefix Caching
+# ---------------------------------------------------------------------------
+enable_prefix_caching: true
+
+# ---------------------------------------------------------------------------
+# GPTQ Quantization
+# ---------------------------------------------------------------------------
+use_gptq: false
+
+# ---------------------------------------------------------------------------
+# Generation behaviour
+# ---------------------------------------------------------------------------
+max_new_tokens: 128
+temperature: 1.0
+
+# ---------------------------------------------------------------------------
+# Benchmark (benchmark.py)
+# ---------------------------------------------------------------------------
+benchmark_num_requests: 20
+benchmark_max_new_tokens: 128
+benchmark_seed: 42
+benchmark_batch_sizes: [1, 4, 8, 16, 20]

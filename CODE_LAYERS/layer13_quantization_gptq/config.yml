@@ -1,0 +1,69 @@
+# Layer 13 — GPTQ Quantization Configuration
+# --------------------------------------------
+# Mirrors sglang's --config pattern (server_args_config_parser.py):
+#   CLI args  >  this file  >  Python hardcoded defaults
+#
+# Usage:
+#   python server.py                        # fp16 model, prefix caching on
+#   python server.py --use-gptq             # switch to GPTQ int4 model
+#   python server.py --model JunHowie/Qwen3-0.6B-GPTQ-Int4 --use-gptq
+
+# ---------------------------------------------------------------------------
+# Model
+# fp16 model is the default. Override --model + --use-gptq for the GPTQ path:
+#   model: JunHowie/Qwen3-0.6B-GPTQ-Int4
+#   use_gptq: true
+# ---------------------------------------------------------------------------
+model: Qwen/Qwen3-0.6B
+device: cuda
+
+# ---------------------------------------------------------------------------
+# Server
+# ---------------------------------------------------------------------------
+host: "0.0.0.0"
+port: 8113
+log_level: warning
+
+# ---------------------------------------------------------------------------
+# Scheduler
+# ---------------------------------------------------------------------------
+max_running: 16
+
+# ---------------------------------------------------------------------------
+# Chunked Prefill
+# ---------------------------------------------------------------------------
+chunked_prefill_size: 512
+max_prefill_tokens: 2048
+
+# ---------------------------------------------------------------------------
+# KV pool
+# ---------------------------------------------------------------------------
+page_size: 16
+
+# ---------------------------------------------------------------------------
+# Prefix Caching
+# ---------------------------------------------------------------------------
+enable_prefix_caching: true
+
+# ---------------------------------------------------------------------------
+# GPTQ Quantization
+# use_gptq: switch the model stack from model/ (fp16 nn.Linear) to
+#           model_gptq/ (int4 GPTQLinear via sgl_kernel.gptq_gemm).
+#           When true, `model` should point to a GPTQ checkpoint such as
+#           JunHowie/Qwen3-0.6B-GPTQ-Int4.
+# ---------------------------------------------------------------------------
+use_gptq: false
+
+# ---------------------------------------------------------------------------
+# Generation behaviour
+# ---------------------------------------------------------------------------
+max_new_tokens: 128
+temperature: 1.0
+
+# ---------------------------------------------------------------------------
+# Benchmark (benchmark.py)
+# ---------------------------------------------------------------------------
+benchmark_num_requests: 20
+benchmark_max_new_tokens: 128
+benchmark_seed: 42
+benchmark_batch_sizes: [1, 4, 8, 16, 20]

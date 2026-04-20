@@ -24,15 +24,19 @@ Mirror of HuggingFace Qwen3Attention (modeling_qwen3.py L222-291) but:
   - Backend object owns kernel selection and mask construction
 """
 
+import sys
+from pathlib import Path
+
 import torch
 import torch.nn as nn
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from forward_batch import ForwardBatch  # noqa: E402
 
 from .backend import PagedBackend
 from .config import Qwen3Config
 from .norm import RMSNorm
 from .rope import apply_rotary_pos_emb
-
-# ForwardBatch imported at use-site via backend.py to avoid circular imports.
 
 
 class Qwen3Attention(nn.Module):
@@ -64,7 +68,7 @@ class Qwen3Attention(nn.Module):
         hidden_states: torch.Tensor,   # [B, q_len, hidden]
         cos:           torch.Tensor,   # [B, q_len, head_dim]
         sin:           torch.Tensor,   # [B, q_len, head_dim]
-        forward_batch,                 # ForwardBatch
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         B, q_len, _ = hidden_states.shape
 

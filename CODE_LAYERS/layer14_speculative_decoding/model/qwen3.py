@@ -27,11 +27,15 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from pathlib import Path
 from typing import Iterable, Tuple
 
 import torch
 import torch.nn as nn
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from forward_batch import ForwardBatch, ForwardMode  # noqa: E402
 
 from .config import Qwen3Config
 from .decoder_layer import Qwen3DecoderLayer
@@ -85,42 +89,58 @@ class Qwen3Model(nn.Module):
         self,
         input_ids: torch.Tensor,                       # [B, q_len]
         attention_mask: torch.Tensor | None,           # [B, kv_len] binary (1=real, 0=pad)
-        kv_cache=None,                                 # KVCache | None
+        kv_cache=None,                                 # ExtendKVCtx | DecodeKVCtx | None
         position_ids: torch.Tensor | None = None,      # [B, q_len] explicit positions
     ) -> torch.Tensor:
         B, q_len = input_ids.shape
-        past_len = kv_cache.get_seq_length() if kv_cache is not None else 0
 
         # ── Token embeddings ──────────────────────────────────────────────
         hidden = self.embed_tokens(input_ids)  # [B, q_len, hidden]
 
         # ── Position IDs and RoPE ─────────────────────────────────────────
-        # With left-padding, real tokens in shorter prompts are shifted right
-        # by `padding_amount` positions.  Without per-example position_ids,
-        # every batch element gets the same sequential [0..q_len-1] range, so
-        # real tokens in padded sequences get wrong RoPE positions.
-        # The caller should supply position_ids computed from attention_mask;
-        # we fall back to sequential positions only for B=1 (no padding).
+        # Model-runner always supplies explicit position_ids for EXTEND/DECODE.
+        # Fallback to sequential [0..q_len-1] for the NOCACHE verify path.
         if position_ids is None:
-            position_ids = torch.arange(
-                past_len, past_len + q_len, device=input_ids.device
-            ).unsqueeze(0).expand(B, -1)                # [B, q_len]
-        cos, sin = self.rotary_emb(hidden, position_ids) # each [B, q_len, head_dim]
+            position_ids = torch.arange(q_len, device=input_ids.device).unsqueeze(0).expand(B, -1)
+        cos, sin = self.rotary_emb(hidden, position_ids)  # each [B, q_len, head_dim]
 
-        # ── Build additive attention mask ─────────────────────────────────
-        # Combines causal masking (future positions → -inf) with padding
-        # masking (pad positions → -inf).  Computed once, shared by all layers.
-        additive_mask = _build_additive_mask(
-            attention_mask=attention_mask,
-            q_len=q_len,
-            kv_len=past_len + q_len,
-            dtype=hidden.dtype,
-            device=hidden.device,
-        )
+        # ── Build ForwardBatch ────────────────────────────────────────────
+        # Detect which kernel path to use from the kv_cache type.
+        # All three modes share the same external model API so model_runner
+        # does not need to change.
+        if kv_cache is not None and hasattr(kv_cache, "extend_wrapper"):
+            # Paged prefill: FlashInfer handles causal masking internally.
+            forward_batch = ForwardBatch(
+                mode=ForwardMode.EXTEND,
+                kv_cache=kv_cache,
+                attention_mask=None,
+            )
+        elif kv_cache is not None:
+            # Paged decode: FlashInfer handles causal masking internally.
+            forward_batch = ForwardBatch(
+                mode=ForwardMode.DECODE,
+                kv_cache=kv_cache,
+                attention_mask=None,
+            )
+        else:
+            # No KV pool: plain F.sdpa (verify_batch.py baseline).
+            # Build the additive mask here so it's precomputed once for all layers.
+            additive_mask = _build_additive_mask(
+                attention_mask=attention_mask,
+                q_len=q_len,
+                kv_len=q_len,   # no past tokens in no-cache mode
+                dtype=hidden.dtype,
+                device=hidden.device,
+            )
+            forward_batch = ForwardBatch(
+                mode=ForwardMode.NOCACHE,
+                kv_cache=None,
+                attention_mask=additive_mask,
+            )
 
         # ── 28 × Decoder layers ───────────────────────────────────────────
         for layer in self.layers:
-            hidden = layer(hidden, cos, sin, additive_mask, kv_cache)
+            hidden = layer(hidden, cos, sin, forward_batch)
 
         return self.norm(hidden)  # [B, q_len, hidden]
 
@@ -276,32 +296,14 @@ class Qwen3ForCausalLM(nn.Module):
         # Cast to target dtype BEFORE copying weights so copy_ is same-dtype.
         model = model.to(dtype)
 
-        # Stream weights — handle both single-file and sharded checkpoints.
-        single = model_dir / "model.safetensors"
-        if single.exists():
-            shard_paths = [single]
-        else:
-            import json
-            index_path = model_dir / "model.safetensors.index.json"
-            if not index_path.exists():
-                raise FileNotFoundError(
-                    f"Cannot find model weights in {model_dir}. "
-                    "Expected model.safetensors or model.safetensors.index.json"
-                )
-            with open(index_path) as f:
-                index = json.load(f)
-            # weight_map maps param_name → shard filename; collect unique shards
-            shard_paths = sorted({
-                model_dir / fname
-                for fname in index["weight_map"].values()
-            })
-        logger.info(f"Reading {len(shard_paths)} weight shard(s) from {model_dir}")
+        # Stream weights from safetensors (one tensor at a time, no full copy).
+        weights_path = model_dir / "model.safetensors"
+        logger.info(f"Reading weights: {weights_path}")
 
         def _iter():
-            for path in shard_paths:
-                with safe_open(str(path), framework="pt", device="cpu") as f:
-                    for key in f.keys():
-                        yield key, f.get_tensor(key).to(dtype)
+            with safe_open(str(weights_path), framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    yield key, f.get_tensor(key).to(dtype)
 
         model.load_weights(_iter())
 

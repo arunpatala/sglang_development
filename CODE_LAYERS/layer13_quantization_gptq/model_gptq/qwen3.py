@@ -37,11 +37,15 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 from pathlib import Path
 from typing import Iterable, Tuple
 
 import torch
 import torch.nn as nn
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from forward_batch import ForwardBatch, ForwardMode  # noqa: E402
 
 from .config import Qwen3Config
 from .decoder_layer import Qwen3DecoderLayer
@@ -106,30 +110,48 @@ class Qwen3Model(nn.Module):
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor | None,
-        kv_cache=None,
+        kv_cache=None,                                # ExtendKVCtx | DecodeKVCtx | None
         position_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         B, q_len = input_ids.shape
-        past_len  = kv_cache.get_seq_length() if kv_cache is not None else 0
 
         hidden = self.embed_tokens(input_ids)
 
+        # Model-runner always supplies explicit position_ids for EXTEND/DECODE.
+        # Fallback to sequential [0..q_len-1] for the NOCACHE verify path.
         if position_ids is None:
-            position_ids = torch.arange(
-                past_len, past_len + q_len, device=input_ids.device
-            ).unsqueeze(0).expand(B, -1)
+            position_ids = torch.arange(q_len, device=input_ids.device).unsqueeze(0).expand(B, -1)
         cos, sin = self.rotary_emb(hidden, position_ids)
 
-        additive_mask = _build_additive_mask(
-            attention_mask=attention_mask,
-            q_len=q_len,
-            kv_len=past_len + q_len,
-            dtype=hidden.dtype,
-            device=hidden.device,
-        )
+        # ── Build ForwardBatch ────────────────────────────────────────────
+        if kv_cache is not None and hasattr(kv_cache, "extend_wrapper"):
+            forward_batch = ForwardBatch(
+                mode=ForwardMode.EXTEND,
+                kv_cache=kv_cache,
+                attention_mask=None,
+            )
+        elif kv_cache is not None:
+            forward_batch = ForwardBatch(
+                mode=ForwardMode.DECODE,
+                kv_cache=kv_cache,
+                attention_mask=None,
+            )
+        else:
+            additive_mask = _build_additive_mask(
+                attention_mask=attention_mask,
+                q_len=q_len,
+                kv_len=q_len,
+                dtype=hidden.dtype,
+                device=hidden.device,
+            )
+            forward_batch = ForwardBatch(
+                mode=ForwardMode.NOCACHE,
+                kv_cache=None,
+                attention_mask=additive_mask,
+            )
 
         for layer in self.layers:
-            hidden = layer(hidden, cos, sin, additive_mask, kv_cache)
+            hidden = layer(hidden, cos, sin, forward_batch)
 
         return self.norm(hidden)
 

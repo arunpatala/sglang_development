@@ -1,0 +1,65 @@
+# Layer 11 — Chunked Prefill Configuration
+# -----------------------------------------
+# Mirrors sglang's --config pattern (server_args_config_parser.py):
+#   CLI args  >  this file  >  Python hardcoded defaults
+#
+# Usage:
+#   python server.py                                   # loads this file automatically
+#   python server.py --port 8200                       # overrides just the port; rest from here
+#   python server.py --chunked-prefill-size 512        # smaller chunks for tighter interleaving
+#   python server.py --max-prefill-tokens 2048         # tighter per-round token budget
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+model: Qwen/Qwen3-0.6B
+device: cuda
+
+# ---------------------------------------------------------------------------
+# Server
+# ---------------------------------------------------------------------------
+host: "0.0.0.0"
+port: 8111
+log_level: warning  # uvicorn access-log verbosity
+
+# ---------------------------------------------------------------------------
+# Scheduler
+# ---------------------------------------------------------------------------
+max_running: 16      # max requests in the decode batch simultaneously
+
+# ---------------------------------------------------------------------------
+# Chunked Prefill
+# Splitting long prompts into fixed-size chunks lets the scheduler interleave
+# decode steps between each chunk, preventing decode starvation.
+#
+# chunked_prefill_size: max tokens processed per request per prefill round.
+#   0         → disabled (full prompt processed in one shot, Layer 9 behaviour)
+#   256-2048  → typical values; smaller = more interleaving, more overhead
+#
+# max_prefill_tokens: total token budget across all new requests per round.
+#   Controls how many prompts can be added to the batch in a single extend
+#   step, regardless of individual prompt lengths.
+# ---------------------------------------------------------------------------
+chunked_prefill_size: 512    # tokens per chunk; 0 = no chunking
+max_prefill_tokens: 2048     # total new-token budget per extend round
+
+# ---------------------------------------------------------------------------
+# KV pool
+# page_size: number of tokens per KV page (must match compile-time constant).
+# Smaller pages → finer-grained allocation; larger → better memory locality.
+# ---------------------------------------------------------------------------
+page_size: 16
+
+# ---------------------------------------------------------------------------
+# Generation behaviour
+# ---------------------------------------------------------------------------
+max_new_tokens: 128  # default when the request does not specify
+temperature: 1.0
+
+# ---------------------------------------------------------------------------
+# Benchmark (benchmark.py)
+# ---------------------------------------------------------------------------
+benchmark_num_requests: 20
+benchmark_max_new_tokens: 128
+benchmark_seed: 42
+benchmark_batch_sizes: [1, 4, 8, 16, 20]

@@ -1,5 +1,5 @@
 """
-Layer 6 — Server: async FastAPI + asyncio.Future bridge to the Scheduler.
+Layer 11 — Server: async FastAPI + asyncio.Future bridge to the Scheduler.
 
 The key pattern (mirrors SGLang's TokenizerManager):
 
@@ -17,9 +17,16 @@ The key pattern (mirrors SGLang's TokenizerManager):
 This decouples HTTP handling (async, I/O-bound) from GPU computation
 (sync, compute-bound) without them ever sharing a thread.
 
-Port: 8105
+Configuration is read from config.yml (same directory as this file).
+CLI args override individual fields:
+    python server.py                                   # all values from config.yml
+    python server.py --port 8200                       # override just the port
+    python server.py --chunked-prefill-size 512        # smaller chunks
+    python server.py --max-prefill-tokens 2048         # tighter token budget
+    python server.py --max-running 8                   # tighter decode batch cap
 """
 
+import argparse
 import asyncio
 import logging
 import sys
@@ -28,6 +35,7 @@ import uuid
 from pathlib import Path
 
 import uvicorn
+import yaml
 from fastapi import FastAPI
 from pydantic import BaseModel
 
@@ -38,6 +46,42 @@ from request import Req
 from scheduler import Scheduler
 from tokenizer import Tokenizer
 
+# ── Config ────────────────────────────────────────────────────────────────────
+
+_CONFIG_FILE = Path(__file__).parent / "config.yml"
+
+def _load_config(cli_overrides: dict) -> dict:
+    """Load config.yml, then apply any CLI overrides on top."""
+    with open(_CONFIG_FILE) as f:
+        cfg = yaml.safe_load(f)
+    cfg.update({k: v for k, v in cli_overrides.items() if v is not None})
+    return cfg
+
+def _parse_args() -> dict:
+    p = argparse.ArgumentParser(description="Layer 11 inference server")
+    p.add_argument("--model",                  type=str,   default=None)
+    p.add_argument("--port",                   type=int,   default=None)
+    p.add_argument("--host",                   type=str,   default=None)
+    p.add_argument("--log-level",              type=str,   default=None, dest="log_level")
+    p.add_argument("--max-running",            type=int,   default=None, dest="max_running")
+    p.add_argument("--chunked-prefill-size",   type=int,   default=None, dest="chunked_prefill_size")
+    p.add_argument("--max-prefill-tokens",     type=int,   default=None, dest="max_prefill_tokens")
+    p.add_argument("--page-size",              type=int,   default=None, dest="page_size")
+    args = p.parse_args()
+    return {k: v for k, v in vars(args).items() if v is not None}
+
+_ARGS = _parse_args()
+_CFG  = _load_config(_ARGS)
+
+MODEL_PATH           = _CFG.get("model",                "Qwen/Qwen3-0.6B")
+PORT                 = int(_CFG.get("port",             8111))
+HOST                 = _CFG.get("host",                 "0.0.0.0")
+LOG_LEVEL            = _CFG.get("log_level",            "warning")
+MAX_RUNNING          = int(_CFG.get("max_running",      16))
+CHUNKED_PREFILL_SIZE = int(_CFG.get("chunked_prefill_size", 512))
+MAX_PREFILL_TOKENS   = int(_CFG.get("max_prefill_tokens",   2048))
+PAGE_SIZE            = int(_CFG.get("page_size",        16))
+
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -45,13 +89,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ── Config ────────────────────────────────────────────────────────────────────
-MODEL_PATH      = "Qwen/Qwen3-0.6B"
-PORT            = 8105
-MAX_RUNNING     = 16     # max simultaneous decode requests
-
 # ── App state ─────────────────────────────────────────────────────────────────
-app       = FastAPI(title="Layer 5 — Continuous Batching")
+app       = FastAPI(title="Layer 11 — Chunked Prefill")
 scheduler: Scheduler = None
 
 
@@ -120,10 +159,20 @@ async def health():
 async def startup():
     global scheduler
 
-    logger.info("Loading model …")
-    runner = ModelRunner(MODEL_PATH)
+    logger.info(
+        f"Starting  model={MODEL_PATH}  port={PORT}  "
+        f"max_running={MAX_RUNNING}  page_size={PAGE_SIZE}  "
+        f"chunked_prefill_size={CHUNKED_PREFILL_SIZE}  "
+        f"max_prefill_tokens={MAX_PREFILL_TOKENS}"
+    )
+    runner = ModelRunner(MODEL_PATH, page_size=PAGE_SIZE)
 
-    scheduler = Scheduler(runner, max_running_reqs=MAX_RUNNING)
+    scheduler = Scheduler(
+        runner,
+        max_running_reqs=MAX_RUNNING,
+        chunked_prefill_size=CHUNKED_PREFILL_SIZE,
+        max_prefill_tokens=MAX_PREFILL_TOKENS,
+    )
 
     # Start the scheduler in a background daemon thread.
     # Pass the running asyncio event loop so the scheduler can call
@@ -144,7 +193,7 @@ async def startup():
 if __name__ == "__main__":
     uvicorn.run(
         "server:app",
-        host="0.0.0.0",
+        host=HOST,
         port=PORT,
-        log_level="info",
+        log_level=LOG_LEVEL,
     )
