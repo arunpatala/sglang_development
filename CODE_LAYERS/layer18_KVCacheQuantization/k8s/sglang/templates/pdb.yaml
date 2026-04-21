@@ -1,0 +1,42 @@
+{{- if .Values.ha.pdb.enabled }}
+# ── PodDisruptionBudget — Prevent Simultaneous Pod Eviction ───────────────────
+#
+# During voluntary disruptions (node drain for maintenance, rolling upgrades,
+# cluster autoscaler scale-down), Kubernetes evicts pods one at a time.
+# Without a PDB, it might evict ALL pods simultaneously if they happen
+# to be on the same node — causing a full outage.
+#
+# minAvailable: 1 means at least 1 pod must always remain running.
+# If all pods are on 1 node and the node is drained: eviction proceeds pod
+# by pod, waiting for the new pod to start before evicting the next.
+
+---
+# Worker PDB: always keep at least 1 GPU worker running during maintenance
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "sglang.fullname" . }}-worker
+  namespace: {{ include "sglang.namespace" . }}
+  labels:
+    {{- include "sglang.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.ha.pdb.workerMinAvailable }}
+  selector:
+    matchLabels:
+      {{- toYaml .Values.worker.labels | nindent 6 }}
+
+---
+# Router PDB: always keep at least 1 router running during maintenance
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "sglang.fullname" . }}-router
+  namespace: {{ include "sglang.namespace" . }}
+  labels:
+    {{- include "sglang.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.ha.pdb.routerMinAvailable }}
+  selector:
+    matchLabels:
+      {{- toYaml .Values.router.labels | nindent 6 }}
+{{- end }}

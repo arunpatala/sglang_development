@@ -1,0 +1,120 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "sglang.fullname" . }}-router
+  namespace: {{ include "sglang.namespace" . }}
+  labels:
+    {{- include "sglang.labels" . | nindent 4 }}
+    {{- toYaml .Values.router.labels | nindent 4 }}
+spec:
+  replicas: {{ .Values.router.replicas }}
+  selector:
+    matchLabels:
+      {{- toYaml .Values.router.labels | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "sglang.labels" . | nindent 8 }}
+        {{- toYaml .Values.router.labels | nindent 8 }}
+      annotations:
+        # Prometheus pod annotation scraping (works without ServiceMonitor)
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.router.metricsPort | quote }}
+        prometheus.io/path: "/metrics"
+    spec:
+      # ── ServiceAccount — REQUIRED for K8s API access ────────────────────────
+      # Without this, the pod uses the "default" ServiceAccount which has no
+      # permission to list/watch pods. Service discovery fails immediately at startup.
+      serviceAccountName: {{ include "sglang.routerServiceAccount" . }}
+
+      containers:
+      - name: router
+        image: "{{ .Values.router.image.repository }}:{{ .Values.router.image.tag }}"
+        imagePullPolicy: {{ .Values.router.image.pullPolicy }}
+
+        command: ["python", "-m", "sglang_router.launch_router"]
+        args:
+          - "--host"
+          - "0.0.0.0"
+          - "--port"
+          - {{ .Values.router.port | quote }}
+          - "--metrics-port"
+          - {{ .Values.router.metricsPort | quote }}
+
+          # ── Routing policy ──────────────────────────────────────────────────
+          - "--policy"
+          - {{ .Values.router.policy | quote }}
+          {{- if eq .Values.router.policy "cache_aware" }}
+          - "--cache-threshold"
+          - {{ .Values.router.cacheThreshold | quote }}
+          - "--balance-abs-threshold"
+          - {{ .Values.router.balanceAbsThreshold | quote }}
+          {{- end }}
+
+          # ── Service discovery — replaces --worker-urls from Layer 15 ────────
+          # The router connects to the K8s API and watches for pods matching
+          # ALL labels in the selector. No static URL list needed.
+          - "--service-discovery"
+          {{- range $k, $v := .Values.router.selector }}
+          - "--selector"
+          - {{ printf "%s=%s" $k $v | quote }}
+          {{- end }}
+          - "--service-discovery-namespace"
+          - {{ .Values.router.watchNamespace | quote }}
+          - "--service-discovery-port"
+          - {{ .Values.router.workerPort | quote }}
+
+        ports:
+        - name: inference
+          containerPort: {{ .Values.router.port }}
+          protocol: TCP
+        - name: metrics
+          containerPort: {{ .Values.router.metricsPort }}
+          protocol: TCP
+
+        resources:
+          {{- toYaml .Values.router.resources | nindent 10 }}
+
+        # ── Readiness Probe ─────────────────────────────────────────────────
+        # Router starts in seconds (no model loading). Short initialDelaySeconds.
+        # Note: the router may briefly return 503 during initial worker discovery
+        # (a few seconds after startup before the first worker is added). This is normal.
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: {{ .Values.router.port }}
+          initialDelaySeconds: {{ .Values.router.readinessProbe.initialDelaySeconds }}
+          periodSeconds: {{ .Values.router.readinessProbe.periodSeconds }}
+          failureThreshold: 3
+
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: {{ .Values.router.port }}
+          initialDelaySeconds: {{ .Values.router.livenessProbe.initialDelaySeconds }}
+          periodSeconds: {{ .Values.router.livenessProbe.periodSeconds }}
+          failureThreshold: {{ .Values.router.livenessProbe.failureThreshold }}
+
+      # ── Pod Anti-Affinity for Router ─────────────────────────────────────────
+      # Router replicas should run on different nodes.
+      # "required" = hard constraint (K8s refuses to schedule both on same node).
+      # Routers are cheap (CPU only), so enforcing this is safe.
+      {{- if .Values.router.podAntiAffinity }}
+      affinity:
+        podAntiAffinity:
+          {{- if eq .Values.router.podAntiAffinityType "required" }}
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                {{- toYaml .Values.router.labels | nindent 16 }}
+            topologyKey: kubernetes.io/hostname
+          {{- else }}
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  {{- toYaml .Values.router.labels | nindent 18 }}
+              topologyKey: kubernetes.io/hostname
+          {{- end }}
+      {{- end }}

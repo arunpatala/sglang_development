@@ -1,0 +1,101 @@
+{{- if .Values.observability.prometheusRule.enabled }}
+# ── PrometheusRule — Alerting Rules ───────────────────────────────────────────
+#
+# Four essential alerts for the SGLang router stack.
+# Requires: prometheus-operator with ruleSelector matching the labels below.
+#
+# How alerts work:
+#   1. Prometheus evaluates expr every 30s
+#   2. If expr is true, alert enters Pending
+#   3. If it stays true for `for` duration, alert fires → AlertManager
+#   4. AlertManager sends to Slack / PagerDuty / email
+#
+# Verify alerts are loaded:
+#   kubectl port-forward -n monitoring svc/prometheus-operated 9090:9090
+#   open http://localhost:9090/alerts
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "sglang.fullname" . }}
+  namespace: {{ include "sglang.namespace" . }}
+  labels:
+    {{- include "sglang.labels" . | nindent 4 }}
+    {{- toYaml .Values.observability.prometheusRule.labels | nindent 4 }}
+spec:
+  groups:
+  - name: sglang.router
+    interval: 30s
+    rules:
+
+    # ── Alert 1: No workers discovered ────────────────────────────────────────
+    # The most critical alert. If this fires, ALL inference requests return 503.
+    # Common causes:
+    #   - RBAC misconfigured: ServiceAccount lacks list/watch on pods
+    #   - Selector mismatch: --selector labels don't match worker pod labels
+    #   - Namespace mismatch: --service-discovery-namespace is wrong
+    # Verify:
+    #   kubectl auth can-i list pods --as=system:serviceaccount:{{ include "sglang.namespace" . }}:{{ include "sglang.routerServiceAccount" . }} -n {{ include "sglang.namespace" . }}
+    #   kubectl get pods -n {{ include "sglang.namespace" . }} -l {{ range $k,$v := .Values.router.selector }}{{ $k }}={{ $v }},{{ end | trimSuffix "," }}
+    - alert: SGLangNoWorkersDiscovered
+      expr: |
+        discovery_workers_discovered{source="kubernetes", namespace="{{ include "sglang.namespace" . }}"} == 0
+      for: 2m
+      labels:
+        severity: critical
+        namespace: {{ include "sglang.namespace" . }}
+      annotations:
+        summary: "SGLang router has discovered 0 workers"
+        description: |
+          The router has 0 workers. All requests return 503.
+          Check RBAC: kubectl auth can-i list pods --as=system:serviceaccount:{{ include "sglang.namespace" . }}:{{ include "sglang.routerServiceAccount" . }} -n {{ include "sglang.namespace" . }}
+          Check pods: kubectl get pods -n {{ include "sglang.namespace" . }} -l app=sglang-worker
+          Check logs: kubectl logs -n {{ include "sglang.namespace" . }} -l app=sglang-router | grep -i error
+
+    # ── Alert 2: High error rate ───────────────────────────────────────────────
+    # 5xx errors sustained over 5 minutes.
+    # Common causes: all workers overloaded, workers crashing, GPU OOM.
+    - alert: SGLangHighErrorRate
+      expr: |
+        (
+          rate(http_requests_total{status=~"5..", namespace="{{ include "sglang.namespace" . }}"}[5m])
+          /
+          rate(http_requests_total{namespace="{{ include "sglang.namespace" . }}"}[5m])
+        ) > {{ .Values.observability.prometheusRule.errorRateThreshold }}
+      for: 5m
+      labels:
+        severity: warning
+        namespace: {{ include "sglang.namespace" . }}
+      annotations:
+        summary: "SGLang router error rate above {{ mulf .Values.observability.prometheusRule.errorRateThreshold 100 }}%"
+        description: "5xx error rate is {{ "{{" }} $value | humanizePercentage {{ "}}" }} over the last 5 minutes."
+
+    # ── Alert 3: High P99 latency ─────────────────────────────────────────────
+    # P99 latency above threshold sustained for 10 minutes.
+    # Common causes: workers overloaded, very long prompts, GPU memory pressure.
+    - alert: SGLangHighP99Latency
+      expr: |
+        histogram_quantile(0.99,
+          rate(http_request_duration_seconds_bucket{namespace="{{ include "sglang.namespace" . }}"}[5m])
+        ) > {{ .Values.observability.prometheusRule.latencyP99Threshold }}
+      for: 10m
+      labels:
+        severity: warning
+        namespace: {{ include "sglang.namespace" . }}
+      annotations:
+        summary: "SGLang P99 latency above {{ .Values.observability.prometheusRule.latencyP99Threshold }}s"
+        description: "P99 latency is {{ "{{" }} $value {{ "}}" }}s. Workers may be overloaded."
+
+    # ── Alert 4: Worker count dropped unexpectedly ────────────────────────────
+    # More than 1 worker lost within 10 minutes — possible node failure or
+    # cascading pod crashes (not a planned scale-down).
+    - alert: SGLangWorkerCountDrop
+      expr: |
+        delta(discovery_workers_discovered{source="kubernetes", namespace="{{ include "sglang.namespace" . }}"}[10m]) < -1
+      for: 0m
+      labels:
+        severity: warning
+        namespace: {{ include "sglang.namespace" . }}
+      annotations:
+        summary: "SGLang worker count dropped by more than 1"
+        description: "Worker count changed by {{ "{{" }} $value {{ "}}" }}. Check for pod failures or node issues."
+{{- end }}
