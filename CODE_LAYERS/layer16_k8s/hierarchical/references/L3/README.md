@@ -1,8 +1,8 @@
-# L3 References: LLM Router / Gateway
+# L3 References: LLM Inference on Kubernetes
 
-**Level:** L3 — Mechanism level (pseudocode, invariants, configuration)
+**Level:** L3 — Technical (mechanisms, production configuration, ecosystem context)
 
-**Reader profile:** Has read the lesson files and wants to understand the design decisions. Comfortable with Python and distributed systems concepts. Wants runnable examples and parameter tables before looking at the SGLang Rust source.
+**Reader profile:** Knows K8s RBAC, Helm, and has deployed services to production. Reads Go/Rust/Python when necessary to understand behavior. Wants to understand *how* the SGLang router's service discovery works, what KEDA actually does differently from prometheus-adapter, and where LWS and GIE fit. Satisfied when they can configure KEDA, explain the ServiceMonitor alignment problem, and describe the difference between L7 gateway routing and application-layer routing.
 
 ---
 
@@ -10,45 +10,47 @@
 
 | # | File | Source | Best for |
 |---|------|--------|----------|
-| 01 | `01_ray_serve_prefix_cache_affinity_router.md` | Ray Docs 2.54.0 | Best short technical description of the two-guard policy design. Full parameter reference. Runnable Python config. |
-| 02 | `02_sglang_router_cli_reference.md` | SGLang Docs | Policy names, parameter defaults, deployment modes. Essential companion to `config.yml`. |
-| 03 | `03_intelligent_router_llm_workloads.md` | arXiv 2408.13510 | Empirical study: establishes round-robin as baseline, Join-Shortest-Queue as `LeastLoadPolicy`, quantifies routing improvement. |
+| 01 | `01_sglang_router_cli_k8s_flags.md` | SGLang Docs | Complete `--service-discovery` flag table, PD mode discovery, cache-aware policy parameters, data-parallel-aware routing, multi-model support. The Layer 16 router command is documented here. |
+| 02 | `02_gpu_autoscaling_prometheus_hpa_vllm.md` | Medium (April 2026) | End-to-end HPA pipeline: kube-prometheus-stack → ServiceMonitor → prometheus-adapter → Custom Metrics API → HPA. Three-part alignment problem. "CPU autoscaling doesn't work for GPU." |
+| 03 | `03_keda_prometheus_scaler.md` | KEDA Docs | KEDA `ScaledObject` reference with Prometheus trigger. Scale-to-zero, scale-from-zero. `cooldownPeriod`, `stabilizationWindowSeconds` tuning for GPU pods. Cloud managed Prometheus support. |
+| 04 | `04_ingress_nginx_sticky_sessions.md` | Ingress-NGINX Docs | Cookie affinity annotations, `balanced` vs `persistent` mode, INGRESSCOOKIE mechanism, `upstream-hash-by` caveats for multi-replica ingress. |
+| 05 | `05_lws_vllm_multi_node_deployment.md` | LWS + vLLM Docs | LeaderWorkerSet for 2-node × 8-GPU vLLM. Marks the boundary between Layer 16 (single-GPU-per-pod) and multi-node tensor-parallel deployment. LWS env vars, leader-only Service. |
+| 06 | `06_gateway_api_inference_extension.md` | Kubernetes Blog (June 2025) | GIE: InferenceModel and InferencePool CRDs, Endpoint Picker (EPP), benchmarks vs round-robin. Where the K8s ecosystem is standardizing LLM-aware routing. |
 
 ---
 
 ## Recommended reading order
 
-**Fast path (30 min):** 01 → 02
-- 01 for the mechanism: two-guard policy with parameter mapping to Layer 15.
-- 02 for the production CLI: how the same parameters are configured in SGLang.
+**Fast path (45 min):** 01 → 03 → 04
+- 01 to lock in the router's K8s flags.
+- 03 for KEDA as the simpler autoscaling path.
+- 04 for session affinity configuration.
 
-**Thorough path (60 min):** 02 → 01 → 03
-- 02 first to orient around production parameter names.
-- 01 for the detailed mechanism.
-- 03 for empirical validation of why three policies are needed.
+**Thorough path (90 min):** 01 → 02 → 03 → 04 → 05 → 06
+- 02 before 03 to understand the problem KEDA solves (prometheus-adapter complexity).
+- 05 after understanding Layer 16 to see what comes next (multi-node).
+- 06 to understand the direction the K8s ecosystem is heading.
 
 ---
 
-## How these map to Layer 15
+## How these map to Layer 16
 
-| Layer 15 `router.py` | Most relevant L3 reference |
-|---------------------|---------------------------|
-| `PrefixCacheAwarePolicy._pick_worker` | 01 (three-tier strategy: load check → prefix match → fallback) |
-| `config.yml` `cache_threshold` | 01 (`match_rate_threshold`), 02 (`--cache-threshold`) |
-| `config.yml` `balance_abs_threshold` | 01 (`imbalanced_threshold`), 02 (`--balance-abs-threshold`) |
-| `config.yml` `policy: round_robin` | 02 (`--policy round_robin`) |
-| `config.yml` `policy: least_load` | 02 (`--policy power_of_two`) |
-| `config.yml` `policy: prefix_cache_aware` | 02 (`--policy cache_aware`) |
-| `Worker.in_flight` | 03 (Join Shortest Queue tracks outstanding request count) |
+| Layer 16 lesson | Most relevant L3 reference |
+|---|---|
+| `05_router_deployment.md` — `--service-discovery` | 01 (complete flag table), 04 (RBAC confirmation) |
+| `06_service_discovery_internals.md` — watcher loop | 01 (CLI → behavior mapping) |
+| `07_observability.md` — ServiceMonitor, alerts | 02 (three-part alignment problem), 03 (KEDA for scaling signals) |
+| `08_high_availability.md` — session affinity, KEDA | 03 (ScaledObject config), 04 (cookie annotation), 05 (LWS context for "what's beyond") |
+| Layer 16 boundary → beyond | 05 (LWS), 06 (GIE) |
 
 ---
 
 ## Common L3 limits to name for readers
 
-These articles **do not explain**:
-- The Rust implementation of `RadixTree` in `sgl-model-gateway/src/policies/cache_aware.rs`.
-- Circuit breaker three-state machine (Closed → Open → HalfOpen).
-- Prometheus metrics format and naming conventions.
-- Kubernetes service discovery via label selectors.
+These articles **do not explain:**
+- The internal Rust implementation of `service_discovery.rs` (watcher loop, kube-rs API).
+- How the SGLang router's CRDT-based gRPC mesh works for HA state sync (issue #10839).
+- The production observability recommendation table in the SGLang model gateway docs (40+ metrics).
+- The full llm-d architecture (disaggregated prefill/decode, hierarchical KV cache).
 
-Those live in L4 (production docs and papers) and L5 (source code).
+Those live in L4 references and lesson files (`06_service_discovery_internals.md`, `07_observability.md`).

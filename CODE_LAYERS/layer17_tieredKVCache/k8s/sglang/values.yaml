@@ -1,0 +1,206 @@
+# ============================================================
+# SGLang Helm Chart — values.yaml
+# ============================================================
+# All values can be overridden at install time:
+#   helm install sglang ./sglang -f my-values.yaml
+#   helm install sglang ./sglang --set worker.replicas=4
+# ============================================================
+
+# ── Namespace ──────────────────────────────────────────────
+namespace:
+  create: true
+  name: production
+
+# ── Model ──────────────────────────────────────────────────
+model:
+  # HuggingFace model ID. Change this to any model you want to serve.
+  name: "meta-llama/Meta-Llama-3.1-8B-Instruct"
+
+  # PVC for model weight cache. Set large enough for your model.
+  # Llama-3 8B in bf16 ≈ 16GB. Leave headroom for multiple checkpoints.
+  storage: "50Gi"
+  storageClassName: "standard"
+
+  # HuggingFace token for gated models (Llama, Gemma, etc.)
+  # Option A: provide the token directly (stored as a K8s Secret)
+  # Option B: reference an existing secret (set hfToken.existingSecret)
+  hfToken:
+    value: ""             # plaintext token — use existingSecret in production
+    existingSecret: ""    # name of a pre-existing secret (takes priority over value)
+    secretKey: "token"    # key inside the secret
+
+# ── Worker (GPU pods) ──────────────────────────────────────
+worker:
+  replicas: 2             # number of GPU worker pods
+  image:
+    repository: lmsysorg/sglang
+    tag: latest
+    pullPolicy: Always
+
+  # Labels the router uses to discover these pods.
+  # MUST match router.selector below.
+  labels:
+    app: sglang-worker
+    component: inference
+
+  # SGLang engine flags
+  port: 8000
+  extraArgs:
+    - "--enable-prefix-caching"   # activates RadixCache (Layer 12)
+    - "--trust-remote-code"
+
+  # GPU and system resources
+  resources:
+    requests:
+      "nvidia.com/gpu": "1"
+      memory: "32Gi"
+      cpu: "8"
+    limits:
+      "nvidia.com/gpu": "1"
+      memory: "64Gi"
+      cpu: "16"
+
+  # Shared memory for CUDA tensor parallelism
+  shm:
+    enabled: true
+    size: "2Gi"
+
+  # Readiness probe — gate before router adds the pod.
+  # Set initialDelaySeconds = (time for model to load) + 30s buffer.
+  # Measure with: kubectl exec <pod> -- time curl localhost:8000/health
+  readinessProbe:
+    initialDelaySeconds: 120
+    periodSeconds: 5
+    failureThreshold: 3
+
+  livenessProbe:
+    initialDelaySeconds: 120
+    periodSeconds: 10
+    failureThreshold: 5
+
+  # Spread workers across different nodes (recommended)
+  podAntiAffinity: true   # soft anti-affinity (prefer different nodes)
+
+# ── Router (CPU pod) ───────────────────────────────────────
+router:
+  replicas: 2             # 2 for fault tolerance; see ha.sessionAffinity
+
+  image:
+    repository: lmsysorg/sglang
+    tag: latest
+    pullPolicy: Always
+
+  labels:
+    app: sglang-router
+
+  # Port for inference requests
+  port: 30000
+  # Port for Prometheus metrics
+  metricsPort: 29000
+
+  # Routing policy: cache_aware | round_robin | power_of_two
+  policy: cache_aware
+
+  # Label selector for worker discovery.
+  # The router watches pods where ALL these labels match.
+  # MUST match worker.labels above.
+  selector:
+    app: sglang-worker
+    component: inference
+
+  # Worker port the router connects to (must match worker.port)
+  workerPort: 8000
+
+  # Namespace to watch for worker pods (should match namespace.name)
+  watchNamespace: production
+
+  # cache_aware policy tuning
+  cacheThreshold: 0.5       # prefix match rate required to prefer a worker
+  balanceAbsThreshold: 32   # max in-flight difference before ignoring cache affinity
+
+  resources:
+    requests:
+      cpu: "1"
+      memory: "512Mi"
+    limits:
+      cpu: "4"
+      memory: "2Gi"
+
+  readinessProbe:
+    initialDelaySeconds: 5
+    periodSeconds: 3
+
+  livenessProbe:
+    initialDelaySeconds: 10
+    periodSeconds: 5
+    failureThreshold: 3
+
+  # Required — allows router to call K8s API for pod discovery
+  serviceAccountName: sglang-router
+
+  # Hard anti-affinity: router replicas MUST be on different nodes
+  # (routers are cheap; losing both to one node failure would be bad)
+  podAntiAffinity: true
+  podAntiAffinityType: required   # required | preferred
+
+# ── High Availability ──────────────────────────────────────
+ha:
+  # Session affinity ensures same client always hits the same router replica,
+  # preserving cache-tree coherence across requests.
+  # See: lesson/08_high_availability.md
+  sessionAffinity:
+    # ClientIP: K8s Service hashes client IP → same router pod always
+    # None: round-robin (cache hit rate drops ~10-20%)
+    type: ClientIP   # ClientIP | None
+    timeoutSeconds: 3600
+
+  # PodDisruptionBudget: prevents draining all pods during node maintenance
+  pdb:
+    enabled: true
+    workerMinAvailable: 1
+    routerMinAvailable: 1
+
+  # HorizontalPodAutoscaler for workers
+  hpa:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 8
+    # Scale when average in-flight requests per pod exceeds this
+    targetRequestsPerPod: 20
+
+# ── Ingress ────────────────────────────────────────────────
+ingress:
+  # Enable to expose the router outside the cluster
+  enabled: false
+  className: nginx
+  host: "llm.example.com"
+  tls: false
+  tlsSecret: ""
+
+  # X-Session-ID based routing.
+  # When enabled, Nginx hashes the X-Session-ID header to consistently
+  # route semantically related requests to the same router pod.
+  # See: lesson/08_high_availability.md — Option B
+  sessionId:
+    enabled: true
+    header: "X-Session-ID"   # header your client code sends
+
+# ── Observability ──────────────────────────────────────────
+observability:
+  # Creates a Prometheus ServiceMonitor (requires prometheus-operator)
+  serviceMonitor:
+    enabled: true
+    interval: 15s
+    # Must match your Prometheus Operator's serviceMonitorSelector
+    labels:
+      release: prometheus
+
+  # Creates PrometheusRule with 4 essential alerts:
+  #   NoHealthyWorkers, ZeroWorkersDiscovered, HighErrorRate, HighLatency
+  prometheusRule:
+    enabled: true
+    labels:
+      release: prometheus
+    # Thresholds
+    errorRateThreshold: 0.05    # 5% error rate triggers alert
+    latencyP99Threshold: 60     # 60s P99 latency triggers alert

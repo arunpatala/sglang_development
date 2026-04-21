@@ -1,0 +1,134 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "sglang.fullname" . }}-worker
+  namespace: {{ include "sglang.namespace" . }}
+  labels:
+    {{- include "sglang.labels" . | nindent 4 }}
+    {{- toYaml .Values.worker.labels | nindent 4 }}
+spec:
+  replicas: {{ .Values.worker.replicas }}
+  selector:
+    matchLabels:
+      {{- toYaml .Values.worker.labels | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "sglang.labels" . | nindent 8 }}
+        {{- toYaml .Values.worker.labels | nindent 8 }}
+        # model label is informational — lets you filter by model in kubectl
+        model: {{ .Values.model.name | replace "/" "-" | lower | trunc 63 }}
+    spec:
+      # Workers don't need K8s API access — use default ServiceAccount
+      serviceAccountName: default
+
+      containers:
+      - name: worker
+        image: "{{ .Values.worker.image.repository }}:{{ .Values.worker.image.tag }}"
+        imagePullPolicy: {{ .Values.worker.image.pullPolicy }}
+
+        command: ["python", "-m", "sglang.launch_server"]
+        args:
+          - "--model"
+          - {{ .Values.model.name | quote }}
+          - "--host"
+          - "0.0.0.0"        # MUST be 0.0.0.0 — the router connects to the pod IP, not localhost
+          - "--port"
+          - {{ .Values.worker.port | quote }}
+          {{- range .Values.worker.extraArgs }}
+          - {{ . | quote }}
+          {{- end }}
+
+        env:
+        # HuggingFace token — loaded from Secret, never hardcoded
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: {{ include "sglang.hfSecretName" . }}
+              key: {{ .Values.model.hfToken.secretKey }}
+              optional: true   # allow pods to start even without token (for public models)
+        - name: CUDA_VISIBLE_DEVICES
+          value: "0"
+        - name: NCCL_DEBUG
+          value: "WARN"
+
+        ports:
+        - name: http
+          containerPort: {{ .Values.worker.port }}
+          protocol: TCP
+
+        resources:
+          {{- toYaml .Values.worker.resources | nindent 10 }}
+
+        # ── Readiness Probe — the discovery gate ─────────────────────────────
+        # The router (service_discovery.rs is_healthy()) only adds a pod when
+        # is_ready=true AND status="Running". The readiness probe controls is_ready.
+        # During model loading the pod is Running but NOT Ready — the router ignores it.
+        # Set initialDelaySeconds = (observed model load time) + 30s buffer.
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: {{ .Values.worker.port }}
+          initialDelaySeconds: {{ .Values.worker.readinessProbe.initialDelaySeconds }}
+          periodSeconds: {{ .Values.worker.readinessProbe.periodSeconds }}
+          failureThreshold: {{ .Values.worker.readinessProbe.failureThreshold }}
+          successThreshold: 1
+
+        # ── Liveness Probe — catch deadlocks ─────────────────────────────────
+        # When this fails (failureThreshold consecutive times), K8s restarts the container.
+        # More tolerant than readiness (higher failureThreshold) to avoid restart thrashing
+        # during temporarily slow batches.
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: {{ .Values.worker.port }}
+          initialDelaySeconds: {{ .Values.worker.livenessProbe.initialDelaySeconds }}
+          periodSeconds: {{ .Values.worker.livenessProbe.periodSeconds }}
+          failureThreshold: {{ .Values.worker.livenessProbe.failureThreshold }}
+
+        volumeMounts:
+        # Model weights — downloaded once, reused across restarts
+        - name: model-cache
+          mountPath: /root/.cache/huggingface
+        {{- if .Values.worker.shm.enabled }}
+        # Shared memory for CUDA / NCCL (tensor parallelism)
+        # Default Docker /dev/shm is 64MB — too small for LLM workloads
+        - name: shm
+          mountPath: /dev/shm
+        {{- end }}
+
+      volumes:
+      - name: model-cache
+        persistentVolumeClaim:
+          claimName: {{ include "sglang.pvcName" . }}
+      {{- if .Values.worker.shm.enabled }}
+      - name: shm
+        emptyDir:
+          medium: Memory        # RAM-backed tmpfs (faster than disk)
+          sizeLimit: {{ .Values.worker.shm.size | quote }}
+      {{- end }}
+
+      # ── Node Selection — GPU nodes only ────────────────────────────────────
+      nodeSelector:
+        nvidia.com/gpu.present: "true"
+
+      # Allow scheduling on nodes with the GPU taint.
+      # GPU nodes are typically tainted to prevent CPU-only workloads landing on them.
+      tolerations:
+      - key: "nvidia.com/gpu"
+        operator: "Exists"
+        effect: "NoSchedule"
+
+      # ── Pod Anti-Affinity — spread across nodes ────────────────────────────
+      # Prevents correlated failure: all workers on one node = all down if node dies.
+      {{- if .Values.worker.podAntiAffinity }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  {{- toYaml .Values.worker.labels | nindent 18 }}
+              topologyKey: kubernetes.io/hostname
+      {{- end }}

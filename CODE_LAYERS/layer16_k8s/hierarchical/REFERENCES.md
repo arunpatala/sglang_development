@@ -1,269 +1,378 @@
-# References — LLM Router / Gateway
+# References — LLM Router on Kubernetes
 
-Organized by **reading level** (L1–L5 from `WRITING_GUIDE/PERSONAS.md`) and **category**. Use this when writing or extending lesson content, locating production precedents, or designing exercises.
+Organized by **reading level** (L1–L5) and **category**. Use this when writing or extending lesson content, locating production precedents, or designing exercises.
 
----
-
-## Foundational theory papers
-
-> **Downloaded:** Both foundational papers are available in `references/SURVEY/`. See `references/SURVEY/README.md`.
-
-### Mitzenmacher — the original power-of-two-choices proof (IEEE TPDS 2001)
-
-- **Title:** The Power of Two Choices in Randomized Load Balancing
-- **Author:** Michael Mitzenmacher (Harvard)
-- **Venue:** IEEE Transactions on Parallel and Distributed Systems, Vol. 12, No. 10, Oct. 2001
-- **DOI:** 10.1109/71.963420
-- **PDF:** https://www.eecs.harvard.edu/~michaelm/postscripts/tpds2001.pdf
-- **Level:** L4 (theory spine) / L3 (implication only)
-- **What it contributes:**
-  - Proves that sampling 2 servers at random and routing to the least-loaded one reduces maximum queue depth from O(log n / log log n) to O(log log n) — exponential improvement over random assignment.
-  - This is the direct theoretical ancestor of SGLang's `PowerOfTwoPolicy` and Layer 15's `LeastLoadPolicy`.
-  - The "d=2 vs d=3" result explains why `router.py` samples exactly two workers and not more.
-
-### Mitzenmacher, Richa, Sitaraman — survey of two-choice techniques (2001)
-
-- **Title:** The Power of Two Random Choices: A Survey of Techniques and Results
-- **Authors:** Michael Mitzenmacher, Andrea W. Richa, Ramesh Sitaraman
-- **PDF:** https://eecs.harvard.edu/~michaelm/postscripts/handbook2001.pdf
-- **Level:** L4
-- **What it contributes:**
-  - Comprehensive treatment of the d-choice paradigm beyond the supermarket model.
-  - Covers dynamic task assignment to servers, memory emulation, and routing.
-  - Good background reading before implementing `LeastLoadPolicy._pick_worker`.
+Layer 16 builds directly on Layer 15's routing gateway. The routing policies (round-robin, least-load, cache-aware) are unchanged. The single new concept is replacing the static `--worker-urls` list with Kubernetes service discovery. References therefore cover: **K8s deployment mechanics, RBAC, GPU scheduling, service discovery, observability, and high availability** — not routing theory (see `layer15_router/hierarchical/REFERENCES.md` for that).
 
 ---
 
-## Academic papers on LLM routing and scheduling
+## Primary source: SGLang's own K8s documentation
 
-### Preble — first distributed LLM serving platform with global KV scheduling (ICLR 2025)
+### SGLang Kubernetes Deployment Guide
 
-- **Title:** Preble: Efficient Distributed Prompt Scheduling for LLM Serving
-- **Authors:** Vikranth Srivatsa, Zijian He, Reyna Abhyankar, Dongming Li, Yiying Zhang
-- **Venue:** ICLR 2025
-- **arXiv:** https://arxiv.org/abs/2407.00023
-- **PDF:** https://openreview.net/pdf?id=meKEKDhdnx
-- **Local file:** `references/SURVEY/03_preble_iclr2025_full.md` (full paper, PDF → markdown)
-- **Level:** L4
+- **Docs:** https://www.mintlify.com/sgl-project/sglang/deployment/kubernetes
+- **Level:** L2–L3
 - **What it contributes:**
-  - Proposes the E2 (Exploitation + Exploration) algorithm: route requests to replicas that already hold a matching KV prefix, but occasionally route to underloaded replicas to prevent hotspots.
-  - Maintains a **global radix tree** across GPUs — conceptually identical to Layer 15's `RadixTrie` but at cluster scale.
-  - 1.5×–14.5× improvement in average latency, 2×–10× in p99 latency over SOTA baselines.
-  - Maps directly to `PrefixCacheAwarePolicy`: the `cache_threshold` and `balance_abs_threshold` dials in `config.yml` implement the same exploitation/exploration tradeoff.
-  - Demonstrates that single-GPU prefix caching (vLLM/SGLang RadixAttention) does not extend automatically to distributed deployments — the router must maintain its own prefix state.
+  - Single-node and multi-node (StatefulSet) deployment YAMLs for SGLang on Kubernetes.
+  - PVC configuration for model weight cache.
+  - Prometheus metrics integration (`--enable-metrics`, `--metrics-port 8080`).
+  - HPA configuration for auto-scaling SGLang deployments.
+  - The reference point for how the SGLang project itself recommends K8s deployment — Layer 16 follows the same patterns.
 
-### Srivatsa et al. — Intelligent Router for LLM Workloads (arXiv 2024/2025)
-
-- **Title:** Intelligent Router for LLM Workloads: Improving Performance Through Workload-Aware Load Balancing
-- **Authors:** (IBM Research)
-- **arXiv:** https://arxiv.org/abs/2408.13510
-- **Local file:** `references/SURVEY/04_intelligent_router_ibm_full.md` (full paper, PDF → markdown)
-- **Level:** L4
-- **What it contributes:**
-  - Empirical study establishing that round-robin routing is a strong baseline but breaks down for decode-heavy workloads.
-  - RL-based and workload-guided routing strategies reduce end-to-end latency by up to 15% over round-robin.
-  - Key insight: mixing requests with very different decode lengths on the same instance hurts throughput — the "dedicated small-large split" is an alternative to prefix-cache-aware routing.
-  - Includes a Join-Shortest-Queue baseline that directly corresponds to Layer 15's `LeastLoadPolicy`.
-  - Good empirical backing for why `round_robin` should be the starting point before tuning.
-
-### Xia et al. — SkyWalker: locality-aware cross-region load balancer (EUROSYS 2026)
-
-- **Title:** SkyWalker: A Locality-Aware Cross-Region Load Balancer for LLM Inference
-- **Authors:** Heming Xia et al. (LMSYS)
-- **arXiv:** https://arxiv.org/abs/2505.24095
-- **Venue:** EUROSYS 2026
-- **Local file:** `references/SURVEY/05_skywalker_eurosys2026_full.md` (full paper, PDF → markdown)
-- **Level:** L4–L5
-- **What it contributes:**
-  - Shows that for a 2-replica round-robin setup, memory usage divergence can reach 2.64× — motivating `LeastLoadPolicy` and `PrefixCacheAwarePolicy`.
-  - Benchmark baseline set: Random, Round Robin, Least Load, Consistent Hashing, SGLang Router — same four policies Layer 15 implements (minus consistent hashing).
-  - Introduces selective prompt sharing: transfers KV cache blocks between replicas when prefix overlap is high, avoiding full recomputation — the next step beyond Layer 15's stateless prefix routing.
-  - Confirms SGLang Router is the production baseline for single-region prefix-aware routing.
-
-### A Survey of LLM Inference Systems (arXiv 2025)
-
-- **Title:** A Survey of LLM Inference Systems
-- **arXiv:** https://arxiv.org/html/2506.21901v1
-- **Local file:** `references/SURVEY/06_survey_llm_inference_2025_full.md` (full paper, PDF → markdown)
-- **Level:** L3–L4
-- **What it contributes:**
-  - Section on multi-replica scheduling covers Round Robin, Power-of-Two, Preble, and Disaggregated (PD) serving.
-  - Shows how load balancing fits into the broader inference stack: batching → KV memory → scheduling → routing.
-  - Preble is positioned as the reference for cache-persistent routing; Mitzenmacher's PoT is the reference for load-only routing.
-  - Good survey chapter to read before Layer 15 and before Layer 16 (PD disaggregation).
-
----
-
-## Survey papers
-
-### Zheng et al. — RadixAttention and SGLang (SOSP 2024 / NeurIPS 2024)
-
-- **Title:** SGLang: Efficient Execution of Structured Language Model Programs
-- **Authors:** Lianmin Zheng et al. (LMSYS / UC Berkeley)
-- **arXiv:** https://arxiv.org/abs/2312.07104
-- **Local file:** `references/SURVEY/07_sglang_radixattention_full.md` (full paper, PDF → markdown)
-- **Level:** L3 (background on RadixAttention) / L5 (source study)
-- **What it contributes:**
-  - Introduces RadixAttention, the KV cache data structure that makes prefix caching viable inside a single engine.
-  - Layer 15's `RadixTrie` is a simplified router-side approximation of this structure (text matching, not block-level token matching).
-  - Understanding RadixAttention explains *why* routing to the same engine for the same prefix helps: the engine's RadixAttention will hit in memory and skip recomputation.
-  - The `cache_threshold` parameter in `config.yml` is calibrated against the RadixAttention hit rate.
-
----
-
-## Production router and gateway implementations (L4–L5 reading)
-
-### SGLang Model Gateway — primary production reference
-
-- **Docs:** https://docs.sglang.io/advanced_features/sgl_model_gateway.html
-- **GitHub:** https://github.com/sgl-project/sglang/tree/main/sgl-model-gateway
-- **Router CLI:** https://sgl-project.github.io/advanced_features/router.html
-- **Level:** L4–L5
-- **Key files mapping to Layer 15:**
-  - `sgl-model-gateway/src/policies/round_robin.rs` ↔ `router.py` `RoundRobinPolicy`
-  - `sgl-model-gateway/src/policies/power_of_two.rs` ↔ `router.py` `LeastLoadPolicy`
-  - `sgl-model-gateway/src/policies/cache_aware.rs` ↔ `router.py` `PrefixCacheAwarePolicy`
-  - `sgl-model-gateway/src/core/worker.rs` ↔ `router.py` `Worker` dataclass
-  - `sgl-model-gateway/src/routers/http/router.rs` ↔ `router.py` `Router.route()`
-- **Relevant CLI params:** `--policy`, `--cache-threshold`, `--balance-abs-threshold`, `--worker-urls`
-- **Production features not in Layer 15:** circuit breaker, Prometheus metrics, gRPC routing, PD disaggregation, Kubernetes service discovery, mTLS.
-
-### vLLM Router — derived from SGLang gateway, adds PD disaggregation
-
-- **Blog:** https://vllm.ai/blog/vllm-router-release
-- **GitHub:** https://github.com/vllm-project/vllm/tree/main/vllm/router
-- **Level:** L4–L5
-- **What it contributes:**
-  - Built in Rust, forked from SGLang model gateway, simplified to work with vLLM backends.
-  - Adds consistent hashing (session-level stickiness) and Power-of-Two as first-class policies.
-  - PD disaggregation support: the router manages separate prefill worker pools and decode worker pools and orchestrates the two-phase handoff — the Layer 16 concept previewed in `lesson/09_whats_next.md`.
-  - TTFT benchmark: vLLM Router is 2,000 ms faster than llm-d and Kubernetes-native routing in their benchmark.
-  - Shows that the Layer 15 `router.py` design (FastAPI proxy + policy + worker state) is a faithful minimal version of a real production router.
-
-### Ray Serve PrefixCacheAffinityRouter — cluster-level prefix routing
-
-- **Docs:** https://docs.ray.io/en/releases-2.54.0/serve/llm/user-guides/prefix-aware-routing.html
-- **Level:** L3–L4
-- **What it contributes:**
-  - Multi-tier routing strategy identical in structure to Layer 15: (1) check load balance gap against `imbalanced_threshold`; (2) if balanced, use prefix tree to pick the best-match replica; (3) if imbalanced, route to the least-loaded replica.
-  - The `imbalanced_threshold` ↔ Layer 15's `balance_abs_threshold`; the `match_rate_threshold` ↔ Layer 15's `cache_threshold`.
-  - Demonstrates that the two-guard design (load check before cache affinity) is the correct production pattern, not Layer 15-specific simplification.
-  - Uses a distributed prefix tree actor (Ray distributed object) — the scaled-out version of Layer 15's in-process `RadixTrie`.
-
-### llm-d — Kubernetes-native KV-cache-aware routing
-
-- **Blog (precise scheduling):** https://llm-d.ai/blog/kvcache-wins-you-can-see
-- **Red Hat guide:** https://developers.redhat.com/articles/2025/10/07/master-kv-cache-aware-routing-llm-d-efficient-ai-inference
-- **Level:** L3–L4
-- **What it contributes:**
-  - Production benchmark: precise prefix-cache scheduling is 57× faster TTFT than approximate scheduling in a B2B workload with 150 enterprise customers.
-  - Demonstrates 87.4% cache hit rate achievable when routing is prefix-aware.
-  - Shows what happens when prefix caching is *not* reflected in the router: standard load balancers scatter related requests, wiping out all KV cache reuse within individual vLLM pods.
-  - Architecture: Kubernetes Gateway API Inference Extension (GAIE) with an Endpoint Picker Plugin (EPP) — the production version of `router.py`'s health + routing loop.
-
----
-
-## Explainer blogs and tutorials (L1–L2 reading)
-
-| Level | Link | Why useful |
-|-------|------|------------|
-| L1 | [Portkey: LLM proxy vs AI gateway](https://portkey.ai/blog/llm-proxy-vs-ai-gateway) | Clear taxonomy: proxy (lightweight, dev-time) vs gateway (production control plane). Good framing before explaining why Layer 15 is a "gateway." |
-| L1 | [pkgpulse: Portkey vs LiteLLM vs OpenRouter 2026](https://www.pkgpulse.com/blog/portkey-vs-litellm-vs-openrouter-llm-gateway-2026) | Concise comparison of real LLM gateway products; shows what Layer 15 deliberately omits (semantic caching, guardrails, multi-provider). |
-| L2 | [OptiVerse: Prefix-Aware Routing — Cache-Conscious Request Distribution](https://www.optiversetech.com/blog/prefix-aware-routing) | Best standalone explainer of prefix-aware routing. Covers the cache-blind → cache-aware transition, RadixAttention context, and compares SGLang, vLLM, and Ray Serve implementations. |
-| L2 | [llm-d: KV-Cache Wins You Can See](https://llm-d.ai/blog/kvcache-wins-you-can-see) | Quantifies why naive load balancing breaks KV cache reuse in distributed deployments; 57× TTFT gap between approximate and precise scheduling. Good motivation for `PrefixCacheAwarePolicy`. |
-| L2 | [Red Hat: Master KV cache aware routing with llm-d](https://developers.redhat.com/articles/2025/10/07/master-kv-cache-aware-routing-llm-d-efficient-ai-inference) | Practitioner walkthrough of llm-d configuration; good for L2 "why stateless routing is not enough." |
-| L3 | [Ray Serve prefix-aware routing docs](https://docs.ray.io/en/releases-2.54.0/serve/llm/user-guides/prefix-aware-routing.html) | Best short technical description of the two-guard design (load check → prefix match). Includes runnable Python config. Good L3 bridge before reading `router.py` `PrefixCacheAwarePolicy`. |
-
----
-
-## Production engine gateway docs (L4 reading)
-
-### SGLang Router CLI reference
+### SGLang Router CLI Reference — Kubernetes Integration Section
 
 - **Docs:** https://sgl-project.github.io/advanced_features/router.html
+- **Level:** L3
+- **What it contributes:**
+  - Complete table of `--service-discovery` flags: `--service-discovery`, `--selector`, `--service-discovery-namespace`, `--service-discovery-port`, `--prefill-selector`, `--decode-selector`.
+  - Standard mode vs PD mode service discovery commands.
+  - Confirms that `--worker-urls` and `--service-discovery` are mutually exclusive — enabling service discovery replaces the static URL list entirely.
+  - Origin of GitHub issue #3073 (Jan 2025) which first proposed K8s service discovery; closed Mar 2025 when the feature was merged.
+
+### SGLang Model Gateway Docs — Service Discovery Section
+
+- **Docs:** https://github.com/sgl-project/sglang/blob/main/docs/advanced_features/sgl_model_gateway.md
 - **Level:** L4
-- **Key configuration mapped to Layer 15 `config.yml`:**
+- **What it contributes:**
+  - Section 13 of the gateway docs covers Kubernetes service discovery configuration in full.
+  - Pod labelling guide for service discovery: labels workers must have to be discovered.
+  - Best practice recommendation: "Use Kubernetes Service Discovery: Let the gateway automatically discover and manage workers."
+  - Parameter table for `--service-discovery-namespace`, `--selector`, and PD mode selectors.
+  - Alert rule YAML example (`HighErrorRate`) directly from the SGLang team.
 
-| SGLang CLI flag | Layer 15 `config.yml` key | Default |
-|---|---|---|
-| `--policy` | `router.policy` | `cache_aware` |
-| `--cache-threshold` | `router.cache_threshold` | `0.5` |
-| `--balance-abs-threshold` | `router.balance_abs_threshold` | `32` |
-| `--worker-urls` | `router.workers[*].url` | — |
-| `--host` / `--port` | `router.host` / `router.port` | `127.0.0.1:30000` |
-| `--max-concurrent-requests` | (not in Layer 15) | `64` |
+### SGLang Distributed StatefulSet Example
 
-### SGLang Model Gateway full docs
-
-- **Docs:** https://docs.sglang.io/advanced_features/sgl_model_gateway.html
+- **GitHub:** https://github.com/sgl-project/sglang/blob/main/docker/k8s-sglang-distributed-sts.yaml
 - **Level:** L4–L5
-- **Covers beyond Layer 15:**
-  - gRPC routing with native Rust tokenization
-  - Prefill-decode (PD) disaggregation mode
-  - Circuit breaker and retry logic
-  - Prometheus metrics + OpenTelemetry tracing
-  - Kubernetes service discovery
-  - Multi-model inference gateway
-  - Language bindings (Python / Go)
+- **What it contributes:**
+  - Production YAML for running SGLang in tensor-parallel mode across multiple nodes using a StatefulSet.
+  - Shows how to use `POD_INDEX` env var for `--node-rank` (multi-node setup).
+  - Separate Services for the dist-init port (5000) and the serving port (8000).
+  - Reference for how SGLang's own team structures K8s manifests.
+
+### SGLang Router HA: gRPC Mesh Design — Issue #10839
+
+- **GitHub:** https://github.com/sgl-project/sglang/issues/10839
+- **Level:** L4–L5
+- **Published:** September 2025 (closed November 2025, implementation PR #14108)
+- **What it contributes:**
+  - Design document for the router's HA state-layer: how multiple router replicas eventually converge on the same radix tree without Redis or etcd.
+  - CRDT-based approach (`rust-crdt`) with gRPC bidirectional streaming mesh; eventual consistency, not strong consensus.
+  - State types being synced: worker registry, per-model radix trees, rate-limit buckets, and router membership.
+  - Explains why Layer 16's lesson/08 describes multi-replica cache degradation: radix-tree sync was not yet stable as of early 2026 — confirmed by issue #18058 (Feb 2026): "Is multi-router replica data synchronization available already? No."
+  - Key design constraint: no external datastore; all sync happens in-process via gRPC mesh on port configurable via `--router-mesh-port`.
+
+### SGLang Router Roadmap — Issue #10341
+
+- **GitHub:** https://github.com/sgl-project/sglang/issues/10341
+- **Level:** L3–L4
+- **Published:** September 2025 (closed November 2025)
+- **What it contributes:**
+  - Official roadmap for the SGLang router: multi-model support, gRPC mesh HA, worker management API, data-parallel aware routing, and semantic model selection.
+  - Confirms the items that *are* checked (service discovery with new worker management API, policy registry per model family) vs items still pending (radix-tree sync across replicas, data mesh component).
+  - Good orientation document for understanding what the router is evolving toward beyond Layer 16.
 
 ---
 
-## Blogs and articles — full list by level
+## Source code: the service discovery implementation
 
-### L1 — Orientation (no code, concept + use case)
+### `service_discovery.rs` — SGLang Model Gateway
 
-> **Downloaded:** All three L1 articles are available in `references/L1/`. See `references/L1/README.md` for reading order.
+- **File:** `REPOS/sglang/sgl-model-gateway/src/service_discovery.rs`
+- **Level:** L5 (source study)
+- **What it contributes:**
+  - The production Rust implementation of K8s service discovery used by Layer 16.
+  - Key functions and their line numbers (as read in lesson/06):
+    - `ServiceDiscoveryConfig` struct (line 33): holds `selector`, `namespace`, `port`, `check_interval`.
+    - `matches_selector()` (line 88): AND logic across all label key=value pairs; empty selector returns `false` (safety guard).
+    - `is_healthy()` (line 196): `is_ready && status == "Running"` — both conditions required.
+    - `worker_url()` (line 200): `format!("http://{}:{}", self.ip, port)` — direct pod IP, no Service.
+    - `start_service_discovery()` (line 206): `Client::try_default()` reads in-cluster ServiceAccount token (line 223); `Api::namespaced()` scopes to namespace (line 276).
+    - Watcher loop (line 311–393): `watcher(pods, config).applied_objects()` → `filter_map(should_include)` → `try_for_each(handle_event)`.
+    - Deletion detection (line 349): `deletion_timestamp.is_some()` → `handle_pod_deletion()`.
+    - Exponential backoff (line 308–384): 1s → 2s → 4s → … → 300s max on API disconnect.
+    - `handle_pod_event()` (line 399): dedup via `tracked_pods: HashSet` → `Job::AddWorker`.
+    - `handle_pod_deletion()` (line 533): `tracked_pods.remove()` → `Job::RemoveWorker`.
 
-| Title | Link | Local file | Why useful |
-|-------|------|-----------|------------|
-| Portkey: LLM proxy vs AI gateway | https://portkey.ai/blog/llm-proxy-vs-ai-gateway | `references/L1/01_portkey_llm_proxy_vs_ai_gateway.md` | Defines the gateway concept; distinguishes simple proxy from full gateway (governance, routing, observability). |
-| Portkey AI Gateway introduction | https://portkey-ai-gateway.mintlify.app/introduction | `references/L1/03_portkey_ai_gateway_introduction.md` | Sub-1ms overhead; 250+ providers; shows the scale production gateways operate at — good contrast to Layer 15's teaching-scale `router.py`. |
-| pkgpulse: Portkey vs LiteLLM vs OpenRouter 2026 | https://www.pkgpulse.com/blog/portkey-vs-litellm-vs-openrouter-llm-gateway-2026 | `references/L1/02_pkgpulse_portkey_litellm_openrouter.md` | Positions three real gateways; explains when you need a gateway vs a proxy; shows what Layer 15 deliberately omits. |
+---
 
-### L2 — Definitions + motivation (mechanism, minimal code, examples)
+## Multi-node GPU deployment: LeaderWorkerSet
 
-> **Downloaded:** All four L2 articles are available in `references/L2/`. See `references/L2/README.md` for reading order.
+### LeaderWorkerSet (LWS) — Overview
 
-| Title | Link | Local file | Why useful |
-|-------|------|-----------|------------|
-| OptiVerse: Prefix-Aware Routing | https://www.optiversetech.com/blog/prefix-aware-routing | `references/L2/01_optiverse_prefix_aware_routing.md` | Best standalone explainer: why round-robin wastes KV cache; how prefix trees work in routers; compares SGLang, vLLM, Ray Serve. |
-| llm-d: KV-Cache Wins You Can See | https://llm-d.ai/blog/kvcache-wins-you-can-see | `references/L2/02_llmd_kvcache_wins_you_can_see.md` | Shows the 57× TTFT gap; explains precise vs approximate prefix scoring; motivates the `RadixTrie` in `router.py`. |
-| vLLM Router release blog | https://vllm.ai/blog/vllm-router-release | `references/L2/03_vllm_router_release.md` | Confirms Layer 15's design is a faithful minimal port of the production router (vLLM Router forked from SGLang gateway). |
-| Red Hat: KV cache aware routing with llm-d | https://developers.redhat.com/articles/2025/10/07/master-kv-cache-aware-routing-llm-d-efficient-ai-inference | `references/L2/04_redhat_kv_cache_aware_routing_llmd.md` | Configuration walkthrough + 87.4% cache hit rate benchmark; good "what this gives you" motivation. |
+- **Docs:** https://lws.sigs.k8s.io/docs/overview/
+- **GitHub:** https://github.com/kubernetes-sigs/lws
+- **Level:** L3–L4
+- **What it contributes:**
+  - The Kubernetes-native API for deploying a group of pods as a single replicated unit — the correct primitive for multi-node tensor-parallel inference (e.g., a Llama-3.1 405B that spans 2 nodes × 8 GPUs each).
+  - Key concept: "super-pod" — a `LeaderWorkerSet` replica consists of a leader pod (runs the model server) and N−1 worker pods (join the Ray/NCCL collective); all pods in the group are created and destroyed atomically.
+  - `restartPolicy: RecreateGroupOnPodRestart` — if any pod in the group fails, the entire group is recreated; prevents partial tensor-parallel hangs.
+  - Adopters include: vLLM, SGLang, NVIDIA NIM, NVIDIA Dynamo, llm-d, Amazon EKS — effectively the industry standard for multi-node LLM deployment on K8s.
+  - Layer 16 uses single-GPU-per-pod workers and does not need LWS; this reference marks the line where Layer 16 ends and multi-node deployment begins.
 
-### L3 — Mechanism level (pseudocode, invariants, configuration)
+### LeaderWorkerSet + vLLM — Deployment Guide
 
-> **Downloaded:** All three L3 articles are available in `references/L3/`. See `references/L3/README.md` for reading order.
+- **Docs:** https://docs.vllm.ai/en/stable/deployment/frameworks/lws/
+- **Level:** L3–L4
+- **What it contributes:**
+  - Minimal YAML for deploying vLLM across 2 nodes × 8 GPUs using LWS: leader pod runs `vllm serve` with `--tensor-parallel-size 8 --pipeline_parallel_size 2`; worker pods run the Ray worker script.
+  - `LWS_GROUP_SIZE` and `LWS_LEADER_ADDRESS` env vars are injected automatically by the LWS controller — no manual pod IP wiring needed.
+  - Leader-only ClusterIP Service: the Service selector targets `role: leader` pods, so only the leader exposes port 8080; worker pods are unreachable directly.
+  - Shared memory volume (`/dev/shm: Memory, 15Gi`) is required; same pattern as Layer 16's single-GPU worker YAML.
 
-| # | Title | Link | Local file | Why useful |
-|---|-------|------|-----------|------------|
-| 01 | Ray Serve prefix-aware routing docs | https://docs.ray.io/en/releases-2.54.0/serve/llm/user-guides/prefix-aware-routing.html | `references/L3/01_ray_serve_prefix_cache_affinity_router.md` | Best technical description of the two-guard policy (load check → prefix match); runnable config; parameter reference. |
-| 02 | SGLang Router CLI reference | https://docs.sglang.io/advanced_features/sgl_model_gateway.html | `references/L3/02_sglang_router_cli_reference.md` | Policy reference, parameter table, deployment modes (co-launch vs separate). Essential companion to `config.yml`. |
-| 03 | Intelligent Router paper (arXiv 2408.13510) | https://arxiv.org/abs/2408.13510 | `references/L3/03_intelligent_router_llm_workloads.md` | Empirical study comparing Round Robin, Decode Balancer, and RL-based routing; round-robin baseline validation. |
+---
 
-### L4 — Production + systems (real stacks, benchmarks, tradeoffs)
+## GPU support on Kubernetes
 
-> **Downloaded:** All four L4 articles are available in `references/L4/`. See `references/L4/README.md` for reading order.
+### NVIDIA GPU Operator — Getting Started
 
-| # | Title | Link | Local file | Why useful |
-|---|-------|------|-----------|------------|
-| 01 | SGLang Model Gateway full docs | https://docs.sglang.io/advanced_features/sgl_model_gateway.html | `references/L4/01_sglang_model_gateway_docs.md` | Primary production reference; all features beyond Layer 15 scope; source code mapping to `router.py`. |
-| 02 | Preble (ICLR 2025) | https://arxiv.org/abs/2407.00023 | `references/L4/02_preble_distributed_prompt_scheduling.md` | 1.5×–14.5× latency reduction; E2 algorithm = Layer 15's two-guard design. |
-| 03 | SkyWalker (EUROSYS 2026) | https://arxiv.org/abs/2505.24095 | `references/L4/03_skywalker_cross_region_load_balancer.md` | Cross-region routing; benchmark baseline set matches Layer 15 policies exactly; SGLang Router = recognized production baseline. |
-| 04 | A Survey of LLM Inference Systems (2025) | https://arxiv.org/html/2506.21901v1 | `references/L4/04_survey_llm_inference_systems.md` | §5.2.2 positions Round Robin, PoT, Preble, and PD disaggregation in the full inference stack. |
+- **Docs:** https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/25.9.2/getting-started.html
+- **Level:** L2–L3
+- **What it contributes:**
+  - The standard way to enable `nvidia.com/gpu` as a schedulable resource in a Kubernetes cluster.
+  - Helm install command: `helm install --wait --generate-name -n gpu-operator --create-namespace nvidia/gpu-operator`.
+  - Explains Node Feature Discovery (NFD) dependency for GPU node labelling (`feature.node.kubernetes.io/pci-10de.present=true`).
+  - GPU taint/toleration patterns: GPU nodes are typically tainted to prevent CPU workloads landing on them; worker pods must add the corresponding toleration.
+  - Verification: `kubectl get nodes -o json | jq '.items[].metadata.labels | keys | any(startswith("feature.node.kubernetes.io"))'`.
+  - Current version: v25.9.2 (as of 2026).
 
-### L5 — Build track (source code, integration, contribution)
+---
 
-> **Note:** L5 references are GitHub repositories and source files. Not downloaded; use git clone or browse online.
+## Production reference: vLLM on Kubernetes
 
-| Title | Link | Why useful |
-|-------|------|------------|
-| SGLang sgl-model-gateway source | https://github.com/sgl-project/sglang/tree/main/sgl-model-gateway | Rust implementation of all three Layer 15 policies + circuit breaker + Prometheus; canonical source for `router.py` design. |
-| sglang-router Python package | https://github.com/sgl-project/sglang/tree/main/python/sglang/srt/router | PyO3 bindings wrapping the Rust gateway; shows how to embed the router in a Python launch script. |
-| vllm-router source | https://github.com/vllm-project/vllm/tree/main/vllm/router | Fork of sgl-model-gateway; adds consistent hashing + PD disaggregation orchestration. |
-| Portkey AI Gateway source | https://github.com/Portkey-AI/gateway | TypeScript / Hono framework; shows a production multi-provider gateway with fallback chains, semantic caching, guardrails. |
-| LiteLLM proxy source | https://github.com/BerriAI/litellm | Python; 100+ provider support; budget tracking; good contrast to Layer 15's single-model-family, single-region scope. |
-| Preble source (on vLLM + SGLang) | https://arxiv.org/abs/2407.00023 | Referenced in the paper; distributed scheduler on top of vLLM/SGLang; global radix tree implementation at cluster scale. |
+### vLLM Kubernetes Deployment Guide
+
+- **Docs:** https://docs.vllm.ai/en/stable/deployment/k8s.html
+- **Level:** L2–L3
+- **What it contributes:**
+  - Production-grade YAML for deploying vLLM with GPU resources, PVC, Secret (HF token), readiness/liveness probes.
+  - Best practice note on readiness probe `failureThreshold`: "measure how much time it takes for the model server to show it's ready to serve" — same methodology recommended in lesson/04 for `initialDelaySeconds`.
+  - Shared memory (`/dev/shm`) volume configuration (from `REPOS/vllm/docs/deployment/k8s.md`) — directly referenced in lesson/04_worker_deployment.md.
+  - Local file: `REPOS/vllm/docs/deployment/k8s.md` (read during Layer 16 chapter creation).
+
+### vLLM Production Stack
+
+- **Docs:** https://docs.vllm.ai/projects/production-stack
+- **GitHub:** https://github.com/vllm-project/production-stack
+- **Level:** L3–L4
+- **What it contributes:**
+  - Official K8s-native reference stack for vLLM: Helm chart, Prometheus/Grafana observability, KV-cache-aware routing, HPA with custom metrics.
+  - Architecture directly parallel to Layer 16: serving engine pods + router pod + observability stack, all deployed via Helm.
+  - Prometheus Adapter configuration to expose `vllm_num_requests_waiting` as a custom K8s metric for HPA — same approach used in `k8s/sglang/templates/hpa.yaml`.
+  - Grafana dashboard with KV cache usage, request throughput, and queue depth panels.
+  - Released January 22, 2025 (Berkeley-UChicago collaboration, now official vLLM project).
+
+### vLLM Production Stack RBAC Role
+
+- **GitHub:** https://github.com/vllm-project/production-stack/blob/99ab33ab/operator/config/rbac/role.yaml
+- **Level:** L4–L5
+- **What it contributes:**
+  - Shows the minimal RBAC role for the vLLM operator: `pods: get, list, watch` is the only core resource needed for service discovery (same as Layer 16's `Role`).
+  - Confirms the Layer 16 design choice: pods need only `get/list/watch`, not `create/delete/patch`.
+  - PR #647 (Aug 2025): "Reduce RBAC permissions for secrets to least privilege" — real-world confirmation that minimising RBAC scope is an active production concern.
+
+### vLLM Helm Chart (examples)
+
+- **GitHub:** `REPOS/vllm/examples/online_serving/chart-helm/`
+- **Level:** L4–L5
+- **What it contributes:**
+  - Full Helm chart for vLLM: `templates/deployment.yaml`, `values.yaml`, probes, GPU resources, shared memory volume.
+  - Directly used as reference when building `k8s/sglang/templates/worker-deployment.yaml`.
+  - Shows production Helm chart structure: `_helpers.tpl`, `values.yaml` defaults, conditional templates (`{{- if .Values.ingress.enabled }}`).
+
+---
+
+## NVIDIA NIM on Kubernetes (Helm reference)
+
+### NVIDIA NIM LLM Helm Chart Deployment
+
+- **Docs:** https://docs.nvidia.com/nim/large-language-models/latest/deployment/kubernetes-deployment/helm-k8s.html
+- **Level:** L3–L4
+- **What it contributes:**
+  - The industry reference for Helm-based LLM serving on K8s from NVIDIA.
+  - Key values: `image.repository`, `image.tag`, `model.ngcAPISecret`, `persistence` (PVC), `resources.limits.nvidia.com/gpu`.
+  - PVC sizing guidance: `persistence.size` should be adjusted based on model size and cache usage — same advice in Layer 16's `values.yaml` comments.
+  - Multi-node models via LeaderWorkerSet (LWS) — beyond Layer 16 scope but useful context for what comes after single-GPU-per-pod setups.
+  - Good comparison point: NIM uses a similar pattern (single GPU pod + PVC + secret) but hides it behind higher-level abstractions.
+
+---
+
+## GPU metrics: NVIDIA DCGM Exporter
+
+### NVIDIA DCGM Exporter — GitHub and Docs
+
+- **GitHub:** https://github.com/nvidia/dcgm-exporter
+- **Docs:** https://docs.nvidia.com/datacenter/dcgm/3.1/gpu-telemetry/dcgm-exporter.html
+- **Helm chart:** https://nvidia.github.io/dcgm-exporter/
+- **Level:** L3–L4
+- **What it contributes:**
+  - The standard DaemonSet for exporting GPU hardware metrics (utilization, memory, temperature, SM clock) to Prometheus from every GPU node.
+  - Key metric: `DCGM_FI_DEV_GPU_UTIL` (GPU compute utilization, 0–100%); `DCGM_FI_DEV_FB_USED` (framebuffer / VRAM used in MiB).
+  - Deployed as a DaemonSet — one exporter pod per GPU node; metrics are labelled with `pod`, `namespace`, and `container` so per-pod GPU usage is visible in Prometheus.
+  - The GPU Operator (referenced above) deploys dcgm-exporter automatically when monitoring is enabled — for clusters already using the GPU Operator, no separate install is needed.
+  - Official Grafana dashboard: https://grafana.com/grafana/dashboards/12239
+  - Current version: 4.5.2-4.8.1 (February 2026). Installed via: `helm install --generate-name gpu-helm-charts/dcgm-exporter`.
+  - Why Layer 16 does not include it in the default stack: lesson/07 scrapes the router's own metrics (40+ SMG metrics), not hardware GPU metrics; DCGM exporter is the next layer of observability added when GPU utilization alerting is needed.
+
+---
+
+## Observability: Prometheus + Grafana for GPU LLM workloads
+
+### GPU Autoscaling on Kubernetes: Prometheus Metrics to HPA with vLLM on GKE
+
+- **URL:** https://medium.com/@akrem.issaoui1/gpu-autoscaling-on-kubernetes-from-prometheus-metrics-to-hpa-with-vllm-on-gke-48578e5753d1
+- **Level:** L3
+- **Published:** April 2026
+- **What it contributes:**
+  - End-to-end walkthrough: `kube-prometheus-stack` → ServiceMonitor → Prometheus → custom metrics → HPA.
+  - The three-part alignment problem for cross-namespace ServiceMonitors: named ports + namespace selector + release label must all match.
+  - Real metric names for vLLM (applicable to SGLang): `kv_cache_usage_perc` (not `gpu_cache_usage_perc`) — the "colon vs underscore trap."
+  - Key insight directly quoted: "CPU-based autoscaling doesn't work for LLM workloads. A GPU can be 100% busy while CPU sits idle."
+  - HPA using `vllm:num_requests_waiting` as the custom metric — same pattern used in `k8s/sglang/templates/hpa.yaml`.
+  - KV cache pressure and queue depth alerts via PrometheusRule — mirrors Layer 16's alert design.
+
+### Monitor LLM Inference in Production (2026): Prometheus & Grafana
+
+- **URL:** https://glukhov.org/observability/monitoring-llm-inference-prometheus-grafana/
+- **Level:** L2–L3
+- **Published:** 2026
+- **What it contributes:**
+  - Covers vLLM, TGI, and llama.cpp — the three main open-source inference engines.
+  - ServiceMonitor pattern for Kubernetes Prometheus Operator: create a named port on the Service, reference it in the `endpoints[].port` field.
+  - SLO-style alert examples: high p95 latency (burn rate), queue time p99, error rate >1%, KV cache usage >90%.
+  - Troubleshooting guide for "Prometheus target is DOWN" — useful when ServiceMonitor is configured but targets don't appear.
+
+### vLLM Production Stack Observability README
+
+- **GitHub:** https://github.com/vllm-project/production-stack/blob/99ab33ab/observability/README.md
+- **Level:** L3–L4
+- **What it contributes:**
+  - Reference for deploying `kube-prom-stack` alongside the inference stack.
+  - How to use Prometheus Adapter to expose `vllm_num_requests_waiting` as a K8s custom metric for HPA.
+  - Grafana dashboard screenshots for inference stack monitoring.
+  - Port-forward commands for accessing Prometheus (9090) and Grafana (3000) during development.
+
+---
+
+## Autoscaling beyond HPA: KEDA
+
+### KEDA — Kubernetes Event-Driven Autoscaling (Prometheus Scaler)
+
+- **Docs:** https://keda.sh/docs/latest/scalers/prometheus/
+- **GitHub:** https://github.com/kedacore/keda
+- **Level:** L3
+- **What it contributes:**
+  - KEDA sits between a metric source (Prometheus, Redis, Azure Service Bus, etc.) and the Kubernetes HPA controller, enabling scale-to-zero and scale-from-zero on arbitrary application metrics.
+  - The Prometheus scaler: point `serverAddress` at any Prometheus endpoint, write a PromQL `query`, set a `threshold`, and KEDA drives the HPA accordingly — no prometheus-adapter required.
+  - For GPU LLM workloads: scale workers on `smg_worker_requests_active` (SGLang) or `vllm:num_requests_waiting` (vLLM) rather than CPU; KEDA exposes the metric through the Kubernetes External Metrics API, which HPA reads natively.
+  - `cooldownPeriod` and `stabilizationWindowSeconds` in `advanced.horizontalPodAutoscalerConfig.behavior` prevent flapping — critical for GPU pods that take 60–120s to become ready.
+  - Key difference from prometheus-adapter: prometheus-adapter translates Prometheus metrics into the *Custom Metrics API* (per-object metrics); KEDA uses the *External Metrics API* (cluster-scoped). Both work with HPA; KEDA is simpler to configure and supports scale-to-zero.
+  - Layer 16 mentions KEDA in lesson/08 as the recommended autoscaling path for GPU workloads; this is the reference for its configuration.
+
+### Auto-Scaling GPU Inference Pods in Kubernetes: KEDA, Custom Metrics, and Cost Guards
+
+- **URL:** https://markaicode.com/auto-scaling-gpu-inference-kubernetes/
+- **Level:** L3
+- **What it contributes:**
+  - End-to-end walkthrough: KEDA install via Helm → `ScaledObject` targeting inference queue depth → `behavior` tuning for conservative scale-down → cost circuit-breaker pattern.
+  - ScaledObject with `pollingInterval: 30`, `cooldownPeriod: 600`, `stabilizationWindowSeconds: 300` — production-safe values that prevent thrashing during load spikes.
+  - Cost guard pattern: second KEDA trigger based on cloud billing API metric; if hourly cost exceeds budget, the trigger prevents further scale-up (complementary to `maxReplicaCount`).
+  - Scaling latency benchmark: time from traffic spike to N-th pod serving traffic; dominated by GPU pod startup time (image pull + model load), not KEDA reaction time.
+
+### GPU-Aware Autoscaling for GenAI APIs with KEDA + NVIDIA DCGM
+
+- **URL:** https://towardsaws.com/gpu-aware-autoscaling-for-genai-apis-with-keda-nvidia-dcgm-bbaeee33330e
+- **Level:** L3
+- **Published:** September 2025
+- **What it contributes:**
+  - Walkthrough: DCGM exporter → Prometheus → KEDA `ScaledObject` using `DCGM_FI_DEV_GPU_UTIL` as the scaling signal.
+  - Shows `TriggerAuthentication` CRD for secure Prometheus connection from KEDA.
+  - GPU utilization as a scaling metric: unlike request queue depth, GPU utilization is a hardware signal independent of the inference framework — works with any inference server.
+  - Caveat: GPU utilization lags queue depth by seconds; queue depth is more responsive for latency-sensitive workloads. Use GPU utilization when queue depth metrics are unavailable.
+
+---
+
+## High Availability: Session affinity and ingress routing
+
+### Ingress-NGINX: Sticky Sessions with Cookie Affinity
+
+- **Docs:** https://kubernetes.github.io/ingress-nginx/examples/affinity/cookie/
+- **Level:** L3
+- **What it contributes:**
+  - Official Ingress-NGINX documentation for cookie-based session affinity.
+  - The `INGRESSCOOKIE` mechanism: randomly generated key → consistent hash → same upstream pod.
+  - `affinity-mode: balanced` vs `persistent` — Layer 16 uses the default (`balanced`) to allow redistribution when router pods are rebalanced.
+  - Caveat: "if the backend pool grows NGINX will keep sending requests through the same server of the first request, even if it's overloaded" — confirms that `balanced` mode is preferred for router pods.
+
+### Revisiting Session Affinity in Kubernetes
+
+- **URL:** https://medium.com/@rajeshlagishetty/session-affinity-in-kubernetes-899e243f1ead
+- **Level:** L2
+- **Published:** January 2025
+- **What it contributes:**
+  - Clear comparison: `sessionAffinity: ClientIP` (K8s Service) vs Nginx cookie affinity vs IPVS source hashing.
+  - Critical limitation directly quoted: "both approaches of Affinity/Source Hashing will fail if source IPs are NATed" — explains why `X-Session-ID` header hashing is more reliable for users behind corporate NAT or VPN.
+  - Maps directly to Layer 16's decision guide (lesson/08): use ClientIP for simple setups, header-based hashing when clients share IPs.
+
+### Nginx `upstream-hash-by` PR (original implementation)
+
+- **GitHub PR:** https://github.com/kubernetes/ingress-nginx/pull/1490
+- **Level:** L5
+- **What it contributes:**
+  - The original PR (merged 2017) that added `nginx.ingress.kubernetes.io/upstream-hash-by` annotation.
+  - Shows the underlying Nginx config generated: `hash $request_uri consistent;` in the upstream block.
+  - Important caveat from Stack Overflow (2025): `upstream-hash-by` is only deterministic *within* a single ingress-nginx replica. Multiple ingress controller replicas may have different endpoint orderings, causing the same hash to map to different backends. For Layer 16, this means: keep ingress-nginx at 1 replica OR use cookie-based affinity for true stickiness.
+
+---
+
+## Where the ecosystem is going: inference-aware K8s routing
+
+### Kubernetes Gateway API Inference Extension (GIE)
+
+- **K8s blog:** https://kubernetes.io/blog/2025/06/05/introducing-gateway-api-inference-extension/
+- **Docs:** https://gateway-api-inference-extension.sigs.k8s.io/
+- **GitHub:** https://github.com/kubernetes-sigs/gateway-api-inference-extension
+- **Level:** L3–L4
+- **Published:** June 2025
+- **What it contributes:**
+  - The official Kubernetes project that adds LLM-aware routing on top of the standard Gateway API — without requiring a custom router like SGLang's.
+  - Two new CRDs: `InferenceModel` (logical model endpoint, criticality level) and `InferencePool` (backend pods + routing policy).
+  - Endpoint Picker (EPP): a pluggable sidecar that selects the best backend pod for each request based on KV cache load, queue depth, loaded LoRA adapters, and criticality — the same problem SGLang's cache-aware policy solves, but as a K8s-native standard.
+  - Supported implementations (as of 2025–2026): GKE, Istio, NGINX Gateway Fabric, Agentgateway (used by llm-d). SGLang is listed as a supported model server.
+  - Why this matters for Layer 16: Layer 16 routes at the application layer (SGLang's own router); GIE routes at the L7 gateway layer and is the direction the K8s community is standardizing on. Understanding GIE explains where SGLang's `--service-discovery` flag fits in the broader ecosystem.
+
+### llm-d — Kubernetes-Native Distributed LLM Inference
+
+- **Website:** https://llm-d.ai/
+- **GitHub:** https://github.com/llm-d/llm-d/
+- **CNCF blog:** https://www.cncf.io/blog/2026/03/24/welcome-llm-d-to-the-cncf-evolving-kubernetes-into-sota-ai-infrastructure/
+- **Level:** L4
+- **Published:** May 2025 (launched); CNCF Sandbox March 2026
+- **What it contributes:**
+  - The "what comes after" reference for Layer 16: llm-d is the middleware layer between a single inference engine (vLLM/SGLang) and cluster-level orchestration (KServe), adding disaggregated serving, hierarchical KV cache offloading, and inference-aware routing.
+  - Uses LeaderWorkerSet (LWS) for multi-node replicas, Kubernetes Gateway API Inference Extension for routing, and vLLM as the model server — all three are references in this file.
+  - Key features beyond Layer 16 scope: Prefill/Decode disaggregation (separate prefill and decode node pools), hierarchical KV cache offloading (GPU → CPU → NVMe), prefix-cache-aware routing that maintains near-zero TTFT under high QPS, and scale-to-zero autoscaling.
+  - Benchmark (v0.5, Feb 2026): ~3.1k tok/s per B200 decode GPU; 16×16 B200 prefill/decode topology achieves ~50k output tok/s with order-of-magnitude TTFT reduction vs round-robin baseline.
+  - Donated to CNCF Sandbox March 2026 by IBM Research, Red Hat, and Google Cloud; backed by NVIDIA, AMD, CoreWeave, Hugging Face, Intel.
+  - Layer 16 covers the foundation (one router, service discovery, cache-aware routing); llm-d is the production-scale evolution of the same architecture.
+
+---
+
+## Kubernetes runtime reference: the `kube` Rust crate
+
+### kube-rs — Rust Kubernetes Client and Controller Runtime
+
+- **GitHub:** https://github.com/kube-rs/kube
+- **Docs:** https://docs.rs/kube
+- **Crates.io:** https://crates.io/crates/kube-client (v3.1.0, March 2026)
+- **Level:** L4–L5
+- **What it contributes:**
+  - The Rust library used by `service_discovery.rs` to interact with the Kubernetes API.
+  - `Client::try_default()`: tries in-cluster config first (ServiceAccount token), falls back to kubeconfig — exactly what line 223 of `service_discovery.rs` uses.
+  - `Api::namespaced(client, "production")`: scopes all API calls to one namespace (line 277 of `service_discovery.rs`).
+  - `watcher(api, Config::default()).applied_objects()`: the streaming watcher that drives the event loop (line 313 of `service_discovery.rs`). The runtime handles relisting and reconnection automatically under the hood.
+  - `pod_watcher.rs` example: https://github.com/kube-rs/kube/blob/main/examples/pod_watcher.rs — the canonical usage pattern, nearly identical to what `service_discovery.rs` implements.
+  - CNCF Sandbox project. Tested against Kubernetes v1.31+. Current version: 3.1.0.
 
 ---
 
@@ -271,20 +380,22 @@ Organized by **reading level** (L1–L5 from `WRITING_GUIDE/PERSONAS.md`) and **
 
 | Cluster | Key references |
 |---------|---------------|
-| **15a why** — motivation | Portkey proxy vs gateway (L1); OptiVerse prefix-aware routing (L2); llm-d KV-Cache Wins (L2); Preble §1 motivation (L4) |
-| **15b worker abstraction** — `Worker`, `SelectWorkerInfo` | SGLang `core/worker.rs` (L5); Intelligent Router paper baselines (L4); SkyWalker benchmark baselines (L4) |
-| **15c round-robin policy** — `RoundRobinPolicy` | SGLang `policies/round_robin.rs` (L5); Intelligent Router §A.1.5 (L4); SkyWalker Round Robin baseline (L4) |
-| **15d least-load policy** — `LeastLoadPolicy` | Mitzenmacher 2001 PoT (L4 theory); SGLang `policies/power_of_two.rs` (L5); Intelligent Router §A.2.1 Join Shortest Queue (L4) |
-| **15e prefix-cache-aware policy** — `RadixTrie`, `PrefixCacheAwarePolicy` | Preble E2 algorithm (L4); SGLang `policies/cache_aware.rs` (L5); Ray Serve PrefixCacheAffinityRouter docs (L3); OptiVerse blog (L2); llm-d 57× benchmark (L4) |
-| **15f HTTP proxy loop** — `Router.route()`, `check_health` | SGLang `routers/http/router.rs` (L5); vLLM Router blog (L4); llm-d architecture (L4) |
-| **15g what comes next** — PD disaggregation, streaming | vLLM Router PD section (L4); SGLang Gateway PD mode (L4); SkyWalker selective KV transfer (L4); Preble multi-GPU global scheduler (L4) |
+| **16a why** — static URLs break | SGLang K8s docs (L2); SGLang router CLI issue #3073 (L3) |
+| **16b architecture** — K8s components | vLLM K8s guide (L2); SGLang deployment guide (L2); NVIDIA NIM Helm (L3) |
+| **16c rbac** — ServiceAccount, Role, RoleBinding | vLLM production-stack `role.yaml` (L4); RBAC PR #647 (L4) |
+| **16d worker deployment** — GPU pods, probes, PVC | NVIDIA GPU Operator (L3); vLLM K8s guide probes section (L3); SGLang distributed StatefulSet (L4); LWS overview (L3, multi-node context) |
+| **16e router deployment** — `--service-discovery` flags | SGLang Router CLI reference (L3); SGLang Model Gateway docs §13 (L4) |
+| **16f service discovery internals** — `service_discovery.rs` | `service_discovery.rs` source (L5); kube-rs `watcher` docs (L4); `pod_watcher.rs` example (L5) |
+| **16g observability** — Prometheus, ServiceMonitor, alerts | GKE autoscaling article (L3); LLM monitoring blog (L2); vLLM production stack observability (L3); DCGM Exporter (L3, GPU hardware metrics) |
+| **16h high availability** — session affinity, X-Session-ID, HPA | Ingress-NGINX sticky sessions docs (L3); Session affinity medium article (L2); `upstream-hash-by` PR (L5); KEDA Prometheus scaler (L3); KEDA GPU article (L3); SGLang Router HA issue #10839 (L4, radix tree sync roadmap) |
+| **Beyond Layer 16** — multi-node, inference-aware routing | LWS + vLLM (L3); Gateway API Inference Extension (L3); llm-d (L4) |
 
 ---
 
 ## See also
 
+- `lesson/00_outline.md` — full section list for Layer 16.
+- `lesson/summary.md` — narrative overview of all 8 sections.
+- `k8s/README.md` — Helm chart quickstart and values reference.
+- `layer15_router/hierarchical/REFERENCES.md` — routing theory references (Preble, Mitzenmacher, SGLang gateway policies). Layer 16 inherits all of those — this file covers only the K8s-specific additions.
 - `WRITING_GUIDE/PERSONAS.md` — which reference depth fits which reader level.
-- `WRITING_GUIDE/HIERARCHICAL.md` — how these references attach to topic nodes as L1–L5 artifacts.
-- `lesson/00_outline.md` — full section list with code anchors into `router.py`.
-- `lesson/summary.md` — blog-post-style narrative covering all Layer 15 components.
-- `CODE_LAYERS/layer14_speculative_decoding/hierarchical/REFERENCES.md` — reference format this file mirrors.
