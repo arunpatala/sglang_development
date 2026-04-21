@@ -39,6 +39,11 @@ env/
 *.log
 *.out
 
+# CUDA profiler reports (can be very large)
+*.ncu-rep
+*.nvvp
+*.qdrep
+
 # Secrets
 DOCS/hf_token
 

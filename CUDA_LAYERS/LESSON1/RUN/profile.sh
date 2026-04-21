@@ -10,6 +10,12 @@
 
 set -e
 
+# ncu spawns fresh subprocesses that don't inherit the conda environment.
+# Prepend the conda bin dir so that the correct Python, ninja, and nvcc are found.
+CONDA_BIN=/home/arun/PROJECTS/sglang_development/.conda/bin
+PYTHON=$CONDA_BIN/python
+export PATH="$CONDA_BIN:$PATH"
+
 METRICS="l1tex__t_bytes_pipe_lsu_mem_global_op_ld.sum,\
 l1tex__t_bytes_pipe_lsu_mem_global_op_st.sum,\
 sm__throughput.avg.pct_of_peak_sustained_elapsed,\
@@ -27,27 +33,27 @@ header() {
 
 if [ "$MODE" = "scalar" ] || [ "$MODE" = "all" ]; then
     header "SCALAR COPY — copy_scalar kernel (ex1_1)"
-    ncu \
+    sudo env PATH="$PATH" ncu \
         --kernel-name "copy_scalar" \
         --metrics "$METRICS" \
         --target-processes all \
-        python ex1_1_scalar_copy.py 2>&1 | grep -E "(copy_scalar|Metric|sectors|throughput|dram|bytes)" | head -40
+        $PYTHON ex1_1_scalar_copy.py 2>&1
 fi
 
 if [ "$MODE" = "vec" ] || [ "$MODE" = "all" ]; then
     header "VECTORIZED COPY — copy_vec8_f16 kernel (ex1_4)"
-    ncu \
+    sudo env PATH="$PATH" ncu \
         --kernel-name "copy_vec8_f16" \
         --metrics "$METRICS" \
         --target-processes all \
-        python ex1_4_vec_copy_f16.py 2>&1 | grep -E "(copy_vec8|Metric|sectors|throughput|dram|bytes)" | head -40
+        $PYTHON ex1_4_vec_copy_f16.py 2>&1
 
     header "VECTORIZED SCALE — scale_vec8_f16 kernel (ex1_4)"
-    ncu \
+    sudo env PATH="$PATH" ncu \
         --kernel-name "scale_vec8_f16" \
         --metrics "$METRICS" \
         --target-processes all \
-        python ex1_4_vec_copy_f16.py 2>&1 | grep -E "(scale_vec8|Metric|sectors|throughput|dram|bytes)" | head -40
+        $PYTHON ex1_4_vec_copy_f16.py 2>&1
 fi
 
 echo ""
@@ -68,5 +74,5 @@ echo "    Vectorized → higher (fewer stalls)"
 echo "========================================================"
 echo ""
 echo "For full analysis, use the interactive Nsight Compute GUI:"
-echo "  ncu --set full -o profile_report python ex1_4_vec_copy_f16.py"
+echo "  ncu --set full -o profile_report $PYTHON ex1_4_vec_copy_f16.py"
 echo "  ncu-ui profile_report.ncu-rep   (if GUI available)"
