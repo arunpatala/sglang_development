@@ -1,0 +1,123 @@
+# Layer 15 — Router + Engine Configuration
+# -----------------------------------------
+# Mirrors sglang's --config pattern (server_args_config_parser.py):
+#   CLI args  >  this file  >  Python hardcoded defaults
+#
+# Two processes:
+#   python server.py --port 8114    # Engine A
+#   python server.py --port 8115    # Engine B
+#   python router.py                # Gateway (reads router: section below)
+#
+# Usage:
+#   python server.py                        # fp16 target model, prefix caching on
+#   python server.py --use-gptq             # switch to GPTQ int4 model
+#   python server.py --kv-memory-fraction 0.7   # reduce KV pool for tight VRAM
+
+# ---------------------------------------------------------------------------
+# Model
+# The server uses a single target ModelRunner. The draft model and SpecRunner
+# are created separately in spec_runner.py / verify_speculative.py.
+# For GPTQ: set model: JunHowie/Qwen3-0.6B-GPTQ-Int4 and use_gptq: true
+# ---------------------------------------------------------------------------
+model: Qwen/Qwen3-0.6B
+device: cuda
+
+# ---------------------------------------------------------------------------
+# Server
+# ---------------------------------------------------------------------------
+host: "0.0.0.0"
+port: 8114
+log_level: warning
+
+# ---------------------------------------------------------------------------
+# Scheduler
+# ---------------------------------------------------------------------------
+max_running: 16
+
+# ---------------------------------------------------------------------------
+# Chunked Prefill
+# ---------------------------------------------------------------------------
+chunked_prefill_size: 512
+max_prefill_tokens: 2048
+
+# ---------------------------------------------------------------------------
+# KV pool
+# kv_memory_fraction: fraction of free GPU memory (after model load) for pool.
+# Layer 14 exposes this because speculative decoding runs two models and the
+# target's pool budget needs to be set explicitly.
+# ---------------------------------------------------------------------------
+page_size: 16
+kv_memory_fraction: 0.85
+
+# ---------------------------------------------------------------------------
+# Prefix Caching
+# ---------------------------------------------------------------------------
+enable_prefix_caching: true
+
+# ---------------------------------------------------------------------------
+# GPTQ Quantization
+# ---------------------------------------------------------------------------
+use_gptq: false
+
+# ---------------------------------------------------------------------------
+# Generation behaviour
+# ---------------------------------------------------------------------------
+max_new_tokens: 128
+temperature: 1.0
+
+# ---------------------------------------------------------------------------
+# Benchmark (benchmark.py)
+# ---------------------------------------------------------------------------
+benchmark_num_requests: 20
+benchmark_max_new_tokens: 128
+benchmark_seed: 42
+benchmark_batch_sizes: [1, 4, 8, 16, 20]
+
+# ===========================================================================
+# Router (router.py)
+# ===========================================================================
+# Mirrors sgl-model-gateway config pattern:
+#   --worker-urls http://... http://...
+#   --policy round_robin | least_load | prefix_cache_aware
+#
+# workers: list of backend engine URLs (one entry per server.py instance).
+#   Each worker needs:
+#     url:    full base URL of the engine (must match server.py host+port)
+#     name:   human-readable label for logs and /health output
+#
+# policy: which routing algorithm to use
+#   round_robin        — alternate A, B, A, B (SGLang: RoundRobinPolicy)
+#   least_load         — route to engine with fewest in-flight requests
+#                        (SGLang: PowerOfTwoPolicy)
+#   prefix_cache_aware — build a radix trie per engine from prompt text;
+#                        route same prefix to same engine so its KV cache hits
+#                        (SGLang: CacheAwarePolicy + Tree)
+#
+# cache_threshold: (prefix_cache_aware only)
+#   minimum match ratio [0.0–1.0] to route to the best-match engine.
+#   below this, route to the engine with the smallest trie (most free cache).
+#   SGLang default: 0.5
+#
+# balance_abs_threshold: (prefix_cache_aware only)
+#   if (max_load - min_load) > this value, ignore cache affinity and use
+#   shortest-queue instead. Prevents one engine from starving.
+#   SGLang default: 32
+# ---------------------------------------------------------------------------
+router:
+  host: "0.0.0.0"
+  port: 8200
+  log_level: warning
+
+  # Backend engines — add or remove entries to scale workers
+  workers:
+    - url: "http://localhost:8114"
+      name: "engine-a"
+    - url: "http://localhost:8115"
+      name: "engine-b"
+
+  # Routing policy: round_robin | least_load | prefix_cache_aware
+  policy: prefix_cache_aware
+
+  # prefix_cache_aware tuning (ignored for other policies)
+  cache_threshold: 0.5          # match ratio to prefer cache-hit engine
+  balance_abs_threshold: 32     # load gap that overrides cache affinity

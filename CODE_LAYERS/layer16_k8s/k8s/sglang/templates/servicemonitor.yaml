@@ -1,0 +1,41 @@
+{{- if .Values.observability.serviceMonitor.enabled }}
+# ── ServiceMonitor — Prometheus Scraping ──────────────────────────────────────
+#
+# Tells Prometheus Operator to scrape the router's /metrics endpoint.
+# Prometheus calls http://<router-pod>:{{ .Values.router.metricsPort }}/metrics every {{ .Values.observability.serviceMonitor.interval }}.
+#
+# Requires: prometheus-operator (included in kube-prometheus-stack).
+# Install:
+#   helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+#   helm install prometheus prometheus-community/kube-prometheus-stack \
+#     -n monitoring --create-namespace \
+#     --set prometheus.prometheusSpec.serviceMonitorSelectorNilUsesHelmValues=false
+#
+# Key metrics exposed (from lesson/07_observability.md):
+#   discovery_workers_discovered{source="kubernetes"}   — workers in pool (alert at 0)
+#   discovery_registrations_total                       — worker add events
+#   discovery_deregistrations_total                     — worker remove events
+#   http_requests_total{status}                         — request counts by status code
+#   http_request_duration_seconds                       — latency histogram (p50/p95/p99)
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "sglang.fullname" . }}-router
+  namespace: {{ include "sglang.namespace" . }}
+  labels:
+    {{- include "sglang.labels" . | nindent 4 }}
+    {{- toYaml .Values.observability.serviceMonitor.labels | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      monitoring: enabled
+      {{- toYaml .Values.router.labels | nindent 6 }}
+  namespaceSelector:
+    matchNames:
+    - {{ include "sglang.namespace" . }}
+  endpoints:
+  - port: metrics
+    path: /metrics
+    interval: {{ .Values.observability.serviceMonitor.interval }}
+    scrapeTimeout: 10s
+{{- end }}
