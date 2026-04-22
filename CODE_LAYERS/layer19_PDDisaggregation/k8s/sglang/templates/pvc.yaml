@@ -1,0 +1,25 @@
+# ── PersistentVolumeClaim — Model Weight Cache ────────────────────────────────
+# Worker pods mount this at /root/.cache/huggingface (the default HF cache dir).
+# First pod startup: HuggingFace downloads model weights here.
+# Subsequent startups: files are already present, startup is fast.
+#
+# storage: set to at least model_size_gb * 1.5 (bf16) + 10GB overhead.
+#   Llama-3 8B  ≈ 16GB  → use 30Gi
+#   Llama-3 70B ≈ 140GB → use 200Gi
+#
+# accessMode ReadWriteOnce: one node mounts at a time.
+# For multi-node setups: use ReadWriteMany (requires NFS, EFS, or similar).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "sglang.pvcName" . }}
+  namespace: {{ include "sglang.namespace" . }}
+  labels:
+    {{- include "sglang.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: {{ .Values.model.storage | quote }}
+  storageClassName: {{ .Values.model.storageClassName | quote }}

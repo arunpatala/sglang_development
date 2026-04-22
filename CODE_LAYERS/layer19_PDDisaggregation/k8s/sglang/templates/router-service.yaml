@@ -1,0 +1,49 @@
+# ── Router Service ────────────────────────────────────────────────────────────
+# Provides a stable DNS name and ClusterIP for the router pods.
+# DNS name (inside cluster): <release>-sglang-router.<namespace>.svc.cluster.local
+#
+# NOTE: Worker pods do NOT have a Service in front of them for routing.
+# The router connects directly to each worker pod's IP (from K8s pod discovery).
+# A Service in front of workers would hide individual pod IPs, making
+# prefix-cache-aware routing impossible (the router needs to know which specific
+# pod it's sending to, so its radix tree can track per-worker cache state).
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "sglang.fullname" . }}-router
+  namespace: {{ include "sglang.namespace" . }}
+  labels:
+    {{- include "sglang.labels" . | nindent 4 }}
+    {{- toYaml .Values.router.labels | nindent 4 }}
+    # Label for Prometheus ServiceMonitor selector
+    monitoring: enabled
+spec:
+  selector:
+    {{- toYaml .Values.router.labels | nindent 4 }}
+  ports:
+  - name: inference
+    port: {{ .Values.router.port }}
+    targetPort: inference
+    protocol: TCP
+  - name: metrics
+    port: {{ .Values.router.metricsPort }}
+    targetPort: metrics
+    protocol: TCP
+  type: ClusterIP
+
+  # ── Session Affinity ────────────────────────────────────────────────────────
+  # When ha.sessionAffinity.type = "ClientIP":
+  #   K8s hashes the client IP and routes to the same router pod each time.
+  #   This preserves the radix tree coherence: same client → same router →
+  #   same worker for repeated prefix requests → higher KV cache hit rate.
+  #
+  # Limitation: breaks down for clients behind NAT (many IPs → one IP).
+  # For that case, use Ingress with X-Session-ID header (see ingress.yaml).
+  {{- if eq .Values.ha.sessionAffinity.type "ClientIP" }}
+  sessionAffinity: ClientIP
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: {{ .Values.ha.sessionAffinity.timeoutSeconds }}
+  {{- else }}
+  sessionAffinity: None
+  {{- end }}
