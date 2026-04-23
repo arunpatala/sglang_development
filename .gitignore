@@ -1,7 +1,7 @@
 # External repositories — not part of this project
 REPOS/
 .env
-
+.conda_vllm/
 # Python
 __pycache__/
 *.py[cod]
