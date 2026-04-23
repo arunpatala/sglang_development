@@ -1,0 +1,59 @@
+{{- if .Values.ha.hpa.enabled }}
+# ── HorizontalPodAutoscaler — Worker Auto-Scaling ─────────────────────────────
+#
+# Automatically scales worker GPU pods based on load.
+# When the HPA adds a new pod:
+#   pod starts → model loads → readiness probe passes → Ready=True
+#   → K8s watcher fires → router's service_discovery.rs receives event
+#   → handle_pod_event() → Job::AddWorker submitted
+#   → router starts routing to new pod (no restart, no config change needed)
+#
+# Metric used: average in-flight requests per pod.
+# Scale up when avg > targetRequestsPerPod.
+# Scale down when avg drops below (with a cooldown to avoid flapping).
+#
+# Requires prometheus-adapter to expose custom metrics to K8s:
+#   helm install prometheus-adapter prometheus-community/prometheus-adapter \
+#     -n monitoring \
+#     --set prometheus.url=http://prometheus-kube-prometheus-prometheus.monitoring.svc
+#
+# Alternative for simpler setups: use CPU-based scaling (less accurate for GPU workloads
+# since GPU can be 100% busy while CPU is idle).
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "sglang.fullname" . }}-worker
+  namespace: {{ include "sglang.namespace" . }}
+  labels:
+    {{- include "sglang.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "sglang.fullname" . }}-worker
+  minReplicas: {{ .Values.ha.hpa.minReplicas }}
+  maxReplicas: {{ .Values.ha.hpa.maxReplicas }}
+  metrics:
+  # Custom metric: average in-flight requests per worker pod
+  # This is the most accurate signal for GPU LLM workloads.
+  - type: Pods
+    pods:
+      metric:
+        name: sglang_num_running_reqs   # exposed by SGLang worker /metrics endpoint
+      target:
+        type: AverageValue
+        averageValue: {{ .Values.ha.hpa.targetRequestsPerPod | quote }}
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60   # wait 60s before scaling up (avoid premature scale)
+      policies:
+      - type: Pods
+        value: 1                         # add at most 1 pod at a time
+        periodSeconds: 120               # wait 2 min between scale-up steps (GPU pods take time to warm up)
+    scaleDown:
+      stabilizationWindowSeconds: 300   # wait 5 min before scaling down (avoid churning)
+      policies:
+      - type: Pods
+        value: 1                         # remove at most 1 pod at a time
+        periodSeconds: 300
+{{- end }}

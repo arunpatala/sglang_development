@@ -1,0 +1,67 @@
+{{- if .Values.ingress.enabled }}
+# ── Ingress — External Access + X-Session-ID Routing ─────────────────────────
+#
+# Two purposes:
+# 1. Expose the router outside the cluster (optional; internal use can skip this)
+# 2. X-Session-ID header-based routing (when ingress.sessionId.enabled = true)
+#
+# X-Session-ID routing (lesson/08_high_availability.md — Option B):
+#   You define a semantic routing key in your client code. The ingress hashes
+#   that header to consistently route to the same router pod.
+#
+#   The chain:
+#     X-Session-ID header → Nginx hash → same router pod
+#     router pod's radix tree → same worker (GPU)
+#     same GPU → KV cache hit for the shared prefix
+#
+#   What to use as X-Session-ID:
+#     "system-prompt-v2"   → all users with same system prompt → same GPU
+#     "user-{user_id}"     → per-user conversations → one GPU per user
+#     "doc-{document_id}"  → batch chunks of same doc → one GPU for whole doc
+#
+#   Client code:
+#     import openai
+#     client = openai.Client(
+#         base_url="http://{{ .Values.ingress.host }}",
+#         default_headers={"{{ .Values.ingress.sessionId.header }}": "system-prompt-v2"}
+#     )
+#
+# Requires: Nginx Ingress Controller installed in the cluster.
+# Install: helm install ingress-nginx ingress-nginx/ingress-nginx -n ingress-nginx --create-namespace
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "sglang.fullname" . }}-router
+  namespace: {{ include "sglang.namespace" . }}
+  labels:
+    {{- include "sglang.labels" . | nindent 4 }}
+  annotations:
+    {{- if .Values.ingress.sessionId.enabled }}
+    # Hash the X-Session-ID header (or fallback to URI) to pick a consistent upstream.
+    # All requests with the same X-Session-ID value → same router pod → same radix tree
+    # → same worker for repeated prefixes → KV cache hit.
+    nginx.ingress.kubernetes.io/upstream-hash-by: "$http_{{ .Values.ingress.sessionId.header | lower | replace "-" "_" }}"
+    {{- end }}
+    # Pass the header through to the router (router may log it for debugging)
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      proxy_set_header {{ .Values.ingress.sessionId.header }} $http_{{ .Values.ingress.sessionId.header | lower | replace "-" "_" }};
+spec:
+  ingressClassName: {{ .Values.ingress.className | quote }}
+  {{- if .Values.ingress.tls }}
+  tls:
+  - hosts:
+    - {{ .Values.ingress.host | quote }}
+    secretName: {{ .Values.ingress.tlsSecret | quote }}
+  {{- end }}
+  rules:
+  - host: {{ .Values.ingress.host | quote }}
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: {{ include "sglang.fullname" . }}-router
+            port:
+              number: {{ .Values.router.port }}
+{{- end }}

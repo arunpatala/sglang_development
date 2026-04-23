@@ -1,0 +1,22 @@
+apiVersion: v2
+name: sglang
+description: >
+  SGLang LLM Router on Kubernetes — Layer 16 of the SGLang course.
+  Deploys a router with Kubernetes service discovery in front of N GPU worker pods.
+  Covers: RBAC, PVC model cache, readiness gates, Prometheus metrics,
+  Nginx ingress with X-Session-ID affinity, HPA, and PodDisruptionBudgets.
+
+type: application
+version: 0.1.0
+appVersion: "latest"
+
+keywords:
+  - sglang
+  - llm
+  - inference
+  - gpu
+  - router
+  - kubernetes
+
+maintainers:
+  - name: layer16-k8s

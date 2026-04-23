@@ -1,0 +1,50 @@
+# ── ServiceAccount ────────────────────────────────────────────────────────────
+# The router pod runs under this identity.
+# Kubernetes mounts its token at /var/run/secrets/kubernetes.io/serviceaccount/
+# which Client::try_default() in service_discovery.rs reads automatically.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "sglang.routerServiceAccount" . }}
+  namespace: {{ include "sglang.namespace" . }}
+  labels:
+    {{- include "sglang.labels" . | nindent 4 }}
+
+---
+# ── Role ─────────────────────────────────────────────────────────────────────
+# Minimal permissions: read-only on pods, scoped to this namespace only.
+# The router needs:
+#   get   — individual pod lookups
+#   list  — initial bootstrap: enumerate all running pods at startup
+#   watch — streaming event subscription for live pod add/remove
+# Nothing else. No ClusterRole — limiting to namespace prevents cross-namespace leakage.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "sglang.fullname" . }}-router
+  namespace: {{ include "sglang.namespace" . }}
+  labels:
+    {{- include "sglang.labels" . | nindent 4 }}
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch"]
+
+---
+# ── RoleBinding ───────────────────────────────────────────────────────────────
+# Connects the ServiceAccount to the Role.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "sglang.fullname" . }}-router
+  namespace: {{ include "sglang.namespace" . }}
+  labels:
+    {{- include "sglang.labels" . | nindent 4 }}
+subjects:
+- kind: ServiceAccount
+  name: {{ include "sglang.routerServiceAccount" . }}
+  namespace: {{ include "sglang.namespace" . }}
+roleRef:
+  kind: Role
+  name: {{ include "sglang.fullname" . }}-router
+  apiGroup: rbac.authorization.k8s.io
