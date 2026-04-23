@@ -1,23 +1,18 @@
-# Prefill-Decode Disaggregation — From Why to How
+# Multi-LoRA Inference — From Fine-Tuning Economics to Production Serving
 
-**Level:** L1 + L2 — Concept, measurement, architecture, and deployment. No paper math; no source code internals.
+**Level:** L1 + L2 — Concept, economics, architecture, and deployment. No paper-level math; no kernel internals.
 
-**What this file is:** A single coherent blog synthesising all L1 and L2 source material into a progressive narrative. Sections build from "what are prefill and decode?" to "how do I launch a disaggregated SGLang cluster?" Sections above L2 (DistServe formal goodput derivation, Mooncake RDMA internals, SARATHI pipeline analysis, TaiChi SLO regimes, vLLM connector architecture, expert parallelism dispatch internals) are deliberately left out.
+**What this file is:** A single coherent article synthesising all L1 and L2 source material into a progressive narrative. Sections build from "why does serving many fine-tuned models cost so much?" to "how do I launch LoRA serving in SGLang and vLLM today?" Sections above L2 (Punica SGMV kernel CUDA implementation, S-LoRA Unified Paging formal analysis, dLoRA merge/unmerge credit algorithm, CaraServe CPU-assisted prefill design, Loquetier virtualized module internals, InfiniLoRA disaggregated LoRA server) are deliberately left out.
 
 **Sources synthesised:**
-- L1/01 — TDS: Prefill Is Compute-Bound, Decode Is Memory-Bound (April 2026)
-- L1/02 — Jarvis Labs: The Architecture Behind Meta's LLM Serving (January 2026)
-- L1/03 — Jackson MZ: Practical Guide to LLM PD Disaggregation
-- L1/04 — NADDOD: Understanding PD Disaggregation (August 2025)
-- L1/05 — BentoML LLM Inference Handbook
-- L1/06 — LearnCodeCamp: Prefill, Decode, TTFT, and ITL
-- L1/07 — LLM Inference Performance Estimator (interactive roofline tool)
-- L1/08 — NVIDIA Spotlight: Perplexity AI at 435M Queries/Month
-- L1/09 — Hao Zhang: CMU LLM Systems Lecture Slides (DistServe PI)
-- L2/01 — SGLang PD Disaggregation Official Documentation
-- L2/02 — LMSYS Blog: DeepSeek on 96 H100 GPUs (May 2025)
+- L1/01 — Sai Mudhiganti: LoRAX: Serve 1000 Fine-Tuned Models on One GPU (July 2025)
+- L1/02 — João Moura (AWS): LoRA Serving on Amazon SageMaker (January 2024)
+- L1/03 — Neel Shah (Towards AI): The Architectural Paradigm of Multi-Adapter Inference (March 2026)
+- L2/01 — SGLang: LoRA Serving Official Documentation (April 2026)
+- L2/02 — vLLM: LoRA Adapters Official Documentation (April 2026)
+- L2/03 — HuggingFace PEFT: LoRA Developer Guide (April 2026)
 
-**Omitted (above L2):** DistServe paper formal analysis, Splitwise production trace model, Mooncake multi-NIC RDMA topology selection, NIXL UCX/GDS internals, SARATHI chunked-prefill pipeline mechanics, TaiChi SLO-regime switching logic, vLLM connector architecture, expert parallelism dispatch patterns.
+**Omitted (above L2):** Punica SGMV kernel CUDA implementation, S-LoRA Unified Paging formal analysis, dLoRA credit-based merge/unmerge algorithm, CaraServe CPU-assisted prefill, Loquetier virtualised module design, ServerlessLoRA backbone sharing internals, Predictive-LoRA LSTM predictor training, InfiniLoRA disaggregated LoRA server architecture, DoRA and rsLoRA variant mathematics, EVA/PiSSA/OLoRA initialisation strategies.
 
 ---
 
@@ -25,682 +20,811 @@
 
 | § | Title | Sources | Reading time |
 |---|-------|---------|------|
-| 1 | [The Two Phases of Every LLM Request](#1-the-two-phases-of-every-llm-request) | L1/03, L1/06, L1/04 | 3 min |
-| 2 | [The Metrics That Matter: TTFT and ITL](#2-the-metrics-that-matter-ttft-and-itl) | L1/06, L1/09 | 3 min |
-| 3 | [Why One GPU Can't Do Both Well](#3-why-one-gpu-cant-do-both-well) | L1/01, L1/07, L1/06 | 4 min |
-| 4 | [The Hidden Cost of Running Both Phases Together](#4-the-hidden-cost-of-running-both-phases-together) | L1/01, L1/04, L1/05, L1/09 | 4 min |
-| 5 | [Goodput: The Metric That Actually Matters](#5-goodput-the-metric-that-actually-matters) | L1/09 | 2 min |
-| 6 | [How Disaggregation Works](#6-how-disaggregation-works) | L1/02, L1/03, L1/04, L1/09 | 4 min |
-| 7 | [The KV Cache Transfer Tax](#7-the-kv-cache-transfer-tax) | L1/01, L1/02 | 4 min |
-| 8 | [The Handshake: How SGLang Moves the KV Cache](#8-the-handshake-how-sglang-moves-the-kv-cache) | L2/01, L2/02 | 4 min |
-| 9 | [Launching a Disaggregated Cluster](#9-launching-a-disaggregated-cluster) | L2/01 | 4 min |
-| 10 | [Production Evidence at Scale](#10-production-evidence-at-scale) | L1/08, L2/02, L1/01, L1/02 | 4 min |
-| 11 | [When Disaggregation Makes Things Worse](#11-when-disaggregation-makes-things-worse) | L1/01, L1/05 | 3 min |
-| 12 | [The Decision Framework and Cost Arithmetic](#12-the-decision-framework-and-cost-arithmetic) | L1/01, L1/02 | 3 min |
+| 1 | [The Fine-Tuning Explosion and the Serving Crisis](#1-the-fine-tuning-explosion-and-the-serving-crisis) | L1/01, L1/02, L1/03 | 3 min |
+| 2 | [LoRA in a Nutshell: How Adapters Stay Small](#2-lora-in-a-nutshell-how-adapters-stay-small) | L2/03, L1/02, L1/03 | 4 min |
+| 3 | [The Serving Problem: One Base Model, One Thousand Adapters](#3-the-serving-problem-one-base-model-one-thousand-adapters) | L1/02, L1/03 | 4 min |
+| 4 | [The SGMV Kernel: Batching Across Different Adapters](#4-the-sgmv-kernel-batching-across-different-adapters) | L1/02, L1/03 | 4 min |
+| 5 | [Three Pillars of Production Multi-Adapter Serving](#5-three-pillars-of-production-multi-adapter-serving) | L1/03 | 5 min |
+| 6 | [The Live Benchmark: 50 Adapters at the Cost of One](#6-the-live-benchmark-50-adapters-at-the-cost-of-one) | L1/02 | 3 min |
+| 7 | [Serving LoRA Adapters in SGLang](#7-serving-lora-adapters-in-sglang) | L2/01 | 5 min |
+| 8 | [Serving LoRA Adapters in vLLM](#8-serving-lora-adapters-in-vllm) | L2/02 | 4 min |
+| 9 | [The HuggingFace PEFT Checkpoint Format](#9-the-huggingface-peft-checkpoint-format) | L2/03 | 4 min |
+| 10 | [Advanced Production Features](#10-advanced-production-features) | L1/03, L2/02 | 3 min |
+| 11 | [The KV Cache vs Adapter VRAM Trade-off](#11-the-kv-cache-vs-adapter-vram-trade-off) | L1/02, L1/03 | 3 min |
+| 12 | [Decision Framework: When Does Multi-LoRA Serving Pay Off?](#12-decision-framework-when-does-multi-lora-serving-pay-off) | L1/01, L1/02, L1/03 | 3 min |
 
-**Total reading time:** ~42 minutes
-
----
-
-## 1. The Two Phases of Every LLM Request
-
-When you send a message to an LLM, the model doesn't process it in a single continuous operation. Every request — every prompt, every conversation turn — passes through exactly two distinct phases before you see any output.
-
-### Phase 1: Prefill (Prompt Processing)
-
-When a prompt arrives, the model processes the **entire input sequence all at once**, in parallel. Every token in the prompt is processed simultaneously.
-
-For each token, in each attention layer, the model computes three vectors: a Query (Q), a Key (K), and a Value (V). The K and V vectors for every input token are stored in GPU memory — this stored structure is the **KV cache**. It is the model's working memory for the current request.
-
-At the end of prefill, the KV cache is complete and the model has not yet produced a single output token. Prefill is pure setup: building the context the model needs to generate.
-
-> "To make sure inference is not compute- and bandwidth-bound at the same time, we want to separate them." — Jackson MZ
-
-### Phase 2: Decode (Token Generation)
-
-After prefill, the model enters **decode mode**: generating output tokens one at a time, sequentially. Each decode step:
-
-1. Takes the current sequence (prompt + all tokens generated so far)
-2. Predicts the next token
-3. Appends that token to the sequence
-4. Computes K and V for the new token and adds them to the KV cache
-5. Repeats until a stop condition is reached
-
-Because each new token depends on all previous ones, decode **cannot be parallelised across output tokens**. You must generate them one by one. This is the autoregressive constraint — a fundamental property of how transformer language models work.
-
-**Why the KV cache is essential for decode:** Without it, every decode step would require re-computing attention over the entire growing sequence from scratch — O(n²) cost that grows with every token generated. With the cache, each decode step only computes attention for the single new token and attends to the cached past — roughly O(n) total cost across all decode steps. The KV cache is what makes decode tractable.
-
-| Phase | What it does | How it processes tokens | Output |
-|---|---|---|---|
-| Prefill | Processes the input prompt | In parallel — all tokens at once | KV cache |
-| Decode | Generates output tokens | Sequentially — one token per step | Output text |
+**Total reading time:** ~45 minutes
 
 ---
 
-## 2. The Metrics That Matter: TTFT and ITL
+## 1. The Fine-Tuning Explosion and the Serving Crisis
 
-Two user-facing metrics capture the performance of LLM inference — and they map directly to the two phases.
+Fine-tuning large language models has never been easier. Datasets are accessible, tooling is mature, and the PEFT (Parameter-Efficient Fine-Tuning) ecosystem has made the process inexpensive. A motivated ML team can produce dozens of task-specific fine-tuned models in a single sprint.
 
-### Time to First Token (TTFT)
+The problem arrives the moment those models go to production.
 
-TTFT is the elapsed time from **when the request is submitted** to **when the first output token appears** in the response stream.
+A 7-billion-parameter model in half-precision (FP16) occupies approximately **14 gigabytes of GPU VRAM** just for its static weights — before inference, before KV cache, before anything. An enterprise SaaS provider offering custom-tuned models for each of 1,000 customers would, in the traditional deployment model, require 1,000 GPU instances. At $2–$5 per H100 hour, that is millions of dollars monthly in GPU infrastructure — with most instances sitting idle at any given time because most customers are not querying at the same moment.
 
-- TTFT ≈ prefill time + the compute time for the first decode step.
-- Long prompts → higher TTFT (more input tokens to process in prefill).
-- This is the metric users notice most: the "thinking" pause before any text appears.
+The industry's response to the training cost was Parameter-Efficient Fine-Tuning. LoRA and its variants reduced the trainable parameter count to under 1% of the model. A full LLaMA-3.1-8B fine-tune produces 16 GB of weights; a LoRA adapter fine-tune produces 50–200 MB of adapter weights. The 8B parameters of the base model are never touched.
 
-### Inter-Token Latency (ITL) — also called TPOT
+But LoRA solved the training cost without solving the serving cost. Until recently, most inference frameworks required adapters to be **merged** into the base model before serving — effectively recreating the full-weight model for each adapter. You gained on training storage and training compute, and then spent it all back on inference infrastructure.
 
-ITL (Inter-Token Latency) or TPOT (Time Per Output Token) is the **average time between consecutive output tokens** once generation has started.
+> "Fine-tuning large language models is easier than ever. Serving them efficiently? That's where LoRAX steps in." — Sai Mudhiganti, 2025
 
-- ITL is dominated entirely by the decode phase.
-- Lower ITL = text streams in faster = the response feels snappier and more continuous.
-- Typical values on high-end hardware: 20–100ms per token (10–50 tokens per second).
-
-**Together, they define user experience:**
-
-| Metric | What it captures | Dominated by | User impact |
-|---|---|---|---|
-| TTFT | Time until response starts | Prefill | Perceived "hang" before reply |
-| ITL / TPOT | Streaming speed | Decode | Smooth vs stuttering text stream |
-
-A system with low TTFT feels responsive. A system with low ITL feels fast. You want both — and they are controlled by different hardware bottlenecks.
+This is the serving crisis: not a shortage of fine-tuned models, but the inability to serve many of them cheaply from shared hardware.
 
 ---
 
-## 3. Why One GPU Can't Do Both Well
+## 2. LoRA in a Nutshell: How Adapters Stay Small
 
-This is the root of the problem. Prefill and decode don't just have different characteristics — they have **opposite hardware requirements**.
+To understand multi-adapter serving, you need to understand what an adapter actually is and why it can be so small.
 
-### Prefill Is Compute-Bound
+### The Rank Decomposition Idea
 
-During prefill, the model performs large matrix multiplications over the full prompt length. For a 4,096-token prompt, this means computing a full S×S attention matrix per head per layer — at S=4,096, that's 16.7 million multiply-add operations per head per layer.
-
-The bottleneck is the GPU's tensor cores — the hardware is "embarrassingly parallel" and they are saturated. Memory bandwidth is barely used because the computation is so dense relative to the data being moved.
-
-**Measured numbers on H100 SXM (InfoQ analysis, September 2025):**
-- GPU compute utilisation during prefill: **90–95%**
-- Arithmetic intensity: **200–400 FLOP/byte**
-
-### Decode Is Memory-Bound
-
-During decode, each step generates exactly one token. The matrix multiplications are tiny (shape [1 × d] against the full KV cache). There is very little computation per step. But the model must **load the entire KV cache from HBM** on every single decode step.
-
-The bottleneck shifts from the tensor cores to memory bandwidth — the model is waiting for data to arrive from HBM, not for compute to finish.
-
-**Measured numbers on H100 SXM:**
-- GPU compute utilisation during decode: **20–40%**
-- Arithmetic intensity: **60–80 FLOP/byte** (compared to 200–400 during prefill)
-
-**The roofline formula:**
+For any linear layer with weight matrix `W₀ ∈ ℝ^{d×k}`, fine-tuning typically learns a small correction `ΔW`. The LoRA hypothesis is that this correction has low intrinsic dimensionality — it can be well-approximated by a pair of much smaller matrices:
 
 ```
-Prefill arithmetic intensity ≈ SeqLen FLOP/byte
-(scales with prompt length — longer prompts are more compute-bound)
+ΔW ≈ B · A
 
-Decode arithmetic intensity ≈ 1 FLOP/byte
-(constant regardless of sequence length — always memory-bound)
+where A ∈ ℝ^{r×k}  (r ≪ k)
+      B ∈ ℝ^{d×r}  (r ≪ d)
+      r is the "rank", typically 4–64
 ```
 
-This is the key formula. `Decode AI ≈ 1 FLOP/byte` means decode will always sit below the memory bandwidth ceiling on the roofline plot, regardless of how many tensor cores the GPU has. FLOPS are irrelevant for decode. What matters is how fast the GPU can move data from HBM to the compute units.
+Instead of storing and updating all `d × k` parameters of `ΔW`, LoRA stores and trains only the `r × k` parameters of A and the `d × r` parameters of B. For a typical 4096×4096 weight matrix with rank 8, that is 8,192 + 32,768 = 40,960 parameters instead of 16,777,216 — a 410× reduction.
 
-**The practical consequence:** A Llama-3.1-70B model on an H100 hits 92% compute utilisation during prefill. Thirty milliseconds later, during decode, the same GPU drops to 30%. Same hardware, same model weights, same kernel — the arithmetic intensity of the workload fell by 5× between one phase and the next.
+### The Forward Pass
 
-> "The hardware hasn't changed. The model weights are identical. The arithmetic intensity of the workload fell by 5× between one phase and the next." — TDS, April 2026
-
-You are paying for an H100 and getting meaningful work from perhaps 20–30% of it for 90% of every request's lifetime.
-
----
-
-## 4. The Hidden Cost of Running Both Phases Together
-
-The standard deployment is **monolithic serving**: a single pool of GPUs handles both prefill and decode. The scheduler interleaves incoming prefill requests with ongoing decode steps in the same batch.
-
-This creates two distinct problems.
-
-### Problem 1: Real-Time Interference
-
-When a new prefill request enters the batch, it occupies the GPU's tensor cores. Decode steps from other requests must wait. Because prefill is compute-heavy and takes longer per iteration, active decode requests experience a **latency spike** — users watching a streaming response see the text pause mid-sentence while the GPU processes someone else's prompt.
-
-The interference runs both directions:
-- **Prefill → decode interference:** a large prefill entering the batch increases ITL for all active decode requests.
-- **Decode → prefill interference:** when the running queue of decode requests is large, the scheduler deprioritises new prefill requests to protect existing ITL — increasing TTFT for new arrivals.
-
-> "Since prefill primarily determines the TTFT and decode impacts ITL, collocating them makes it difficult to optimize both metrics simultaneously." — BentoML
-
-The key insight: TTFT and ITL are controlled by different hardware bottlenecks. Optimising one phase on shared hardware forces a compromise on the other. There is no scheduling policy that can eliminate this tension on a single GPU pool.
-
-### Problem 2: Sustained Utilisation Waste
-
-The interference problem appears per-request. The utilisation waste is a constant, structural overhead.
-
-A typical generation produces 200–500 output tokens. Each decode step takes 10–30ms. A 300-token response spends roughly **3–9 seconds in decode** and perhaps **200ms in prefill**. The GPU runs decode for 90%+ of wall-clock time — and during that 90%, compute utilisation sits at 20–40%. The tensor cores are idle, waiting for memory bandwidth.
-
-You provisioned H100-class compute to handle prefill peaks, and then spent the vast majority of every request's lifetime doing work that doesn't need those tensor cores.
-
-### The Scheduling Workaround and Its Limits
-
-**Chunked prefill** (also called iterative prefill, popularised by SARATHI) partially addresses the interference problem. Instead of processing an entire long prompt in one massive batch slot, the engine breaks it into smaller chunks and interleaves them with decode steps. This caps the ITL spike any single prefill can cause.
-
-But chunked prefill does not solve the utilisation problem. The GPU is still performing compute-heavy work (prefill chunks) and memory-heavy work (decode steps) in alternation — on the same hardware. The arithmetic intensity still oscillates between 200–400 FLOP/byte and 1 FLOP/byte within the same scheduling window. The fundamental mismatch remains.
-
----
-
-## 5. Goodput: The Metric That Actually Matters
-
-Raw throughput — requests served per second — hides the real cost of colocation. A system can serve many requests per second while violating the latency SLOs that users actually care about.
-
-**Goodput**, introduced formally in the DistServe paper and explained in Hao Zhang's CMU lecture:
-
-> "Goodput = number of requests that meet **both** the TTFT SLO **and** the TPOT SLO per unit time."
-
-A request counts toward goodput only if it satisfies both:
-- TTFT ≤ TTFT_SLO (the response started fast enough)
-- TPOT ≤ TPOT_SLO (each token streamed fast enough)
-
-If either condition is violated, the request doesn't count — even if it completed successfully.
-
-**The SLO space:**
+During inference, the LoRA contribution is computed as:
 
 ```
-TPOT SLO axis (ms/token)
-    │   ┌──────────┐
-    │   │  GOOD    │  ← requests that count toward goodput
-    │   │REQUESTS  │
-    ├───┤          │
-    │   └──────────┘
-    └──────────────────── TTFT SLO axis (ms)
-                     ↑
-              only requests in this box count
+h = W₀ · x  +  B · A · x · (α / r)
 ```
 
-In a monolithic system under load, the TTFT and TPOT SLOs pull against each other. Accepting more requests improves raw throughput but pushes requests outside the SLO box. Under strict SLO constraints, goodput peaks well below raw throughput capacity — and a disaggregated system, by eliminating the interference, fits many more requests inside the box.
+where:
+- `W₀`: frozen base model weights (never changed, never loaded twice regardless of how many adapters you have)
+- `A`: the down-projection matrix (maps input to rank-r space)
+- `B`: the up-projection matrix (maps rank-r space back to output dimension)
+- `α / r`: a scaling factor (analogous to a learning rate; `α` is a hyperparameter, often set to `r` or `2r`)
 
-**DistServe measured goodput improvements of 4–7× over vLLM under strict SLO constraints** (TTFT < 2s, TPOT < 100ms) across OPT-13B, OPT-66B, and LLaMA-2-70B. These are not raw throughput numbers; they are counts of SLO-satisfying requests. Without SLOs, the improvement is smaller — goodput under constraints is where disaggregation truly earns its complexity.
-
----
-
-## 6. How Disaggregation Works
-
-The idea is direct: if prefill and decode have opposite hardware requirements and interfere when colocated, **run them on separate hardware pools**.
-
-> "Disaggregated inference splits these two phases onto separate hardware pools, each sized for what it actually does." — TDS, April 2026
-
-### Three Components
-
-**Component 1: The Router**
-
-A KV-aware router sits in front of both pools as the single entry point for clients. Its job is to:
-1. Receive incoming requests from clients
-2. Route each request to an available prefill worker
-3. After prefill completes, route the resulting KV cache to an available decode worker
-4. Track which decode workers hold which KV caches (enabling prefix cache reuse across requests sharing system prompts)
-
-The router is what allows clients to send requests without knowing which pool handles which phase.
-
-**Component 2: The Prefill Pool**
-
-A set of GPUs optimised for high-throughput matrix multiplication. Prefill workers:
-- Process incoming prompts
-- Build the KV cache for each request
-- Write the KV cache to the network for transfer to a decode worker
-- Never generate output tokens
-
-Because prefill is compute-bound, these GPUs benefit from high FLOPS. They don't need massive HBM capacity — they produce KV caches temporarily and immediately transfer them. Multiple prompts can be batched together, amortising the matrix computation across many requests simultaneously.
-
-**Component 3: The Decode Pool**
-
-A set of GPUs optimised for memory bandwidth and HBM capacity. Decode workers:
-- Receive KV caches from prefill workers
-- Generate output tokens autoregressively using those caches
-- Maintain KV caches for the duration of each generation
-
-Because decode is memory-bound, these GPUs benefit from high HBM bandwidth and large HBM capacity (to hold KV caches for many concurrent users). Large batch sizes amortise HBM reads across many concurrent decode requests, pushing utilisation higher.
-
-**The full flow for one request:**
-
-```
-1. Client request arrives at the Router
-2. Router → Prefill Worker
-3. Prefill Worker: processes prompt, builds KV cache
-4. Prefill Worker → [KV Cache transfer over RDMA/NVLink] → Decode Worker
-5. Decode Worker: generates tokens autoregressively
-6. Decode Worker → Output stream → Client
-```
-
-### Independent Scaling: The Economic Argument
-
-The primary economic benefit of disaggregation is **pool-level independent scaling**:
-
-```
-Workload A: Short prompts, long outputs
-  → 1–2 Prefill Workers + 4–5 Decode Workers
-  (little prefill work; lots of decode work)
-
-Workload B: Long prompts, short outputs
-  → 4–5 Prefill Workers + 1–2 Decode Workers
-  (expensive prefill; quick decode)
-```
-
-In monolithic serving, scaling means adding identical GPU nodes — each capable of both prefill and decode, each provisioned for the worst case of both. With disaggregation, you add only what you need: more prefill capacity or more decode capacity, separately. You stop paying for H100-level compute during decode, and for H200-level memory bandwidth during prefill.
-
-| Optimisation | Prefill Worker | Decode Worker |
-|---|---|---|
-| Optimal batch size | Large (many prompts at once) | Small but many concurrent |
-| GPU type | High FLOPS (H100 SXM) | High HBM bandwidth (H200) |
-| Scheduling | Batch similar-length prompts | Continuous batching |
-| KV cache lifetime | Temporary — transferred immediately | Persistent — held for full generation |
-| Optimal parallelism | Tensor parallelism (reduces latency) | Pipeline parallelism (increases throughput) |
-
----
-
-## 7. The KV Cache Transfer Tax
-
-Disaggregation is not free. The KV cache produced during prefill must move from the prefill GPU to the decode GPU over the network. This is the **KV cache transfer tax**, and it is the primary cost of disaggregation.
-
-### How Big Is It?
-
-The size depends on three model parameters and the prompt length:
-
-```
-KV cache per token = n_layers × n_kv_heads × head_dim × 2 (K and V) × bytes_per_element
-
-For Llama-3.1-70B (GQA):
-  80 layers × 8 KV heads × 128 dims × 2 × 2 bytes (FP16) = 327,680 bytes per token
-
-For a 4K-token prompt:
-  4,096 × 327,680 = 1.34 GB
-```
-
-**Python formula (works for any model):**
+In PyTorch notation (using transposed convention):
 
 ```python
-def kv_cache_bytes(n_layers, n_kv_heads, head_dim, seq_len, dtype_bytes=2):
-    """KV cache size in bytes for a single request."""
-    per_token = n_layers * n_kv_heads * head_dim * 2 * dtype_bytes  # 2 for K and V
-    return per_token * seq_len
-
-# Llama-3.1-70B, 4K-token prompt
-kv_70b = kv_cache_bytes(n_layers=80, n_kv_heads=8, head_dim=128, seq_len=4096)
-# → 1.34 GB
-
-# Llama-3.1-8B, 4K-token prompt
-kv_8b = kv_cache_bytes(n_layers=32, n_kv_heads=8, head_dim=128, seq_len=4096)
-# → 0.54 GB
+h = x @ W0.T  +  (x @ A.T) @ B.T * (lora_alpha / r)
 ```
 
-Run this formula for your model before evaluating whether disaggregation is feasible on your network.
+This is exactly what `LoRAAdapter.apply()` in Layer 20 computes.
 
-### How Long Does It Take?
+### Weight Initialisation
 
-The transfer time determines how much the KV transfer adds to TTFT. The decode worker cannot start generating tokens until the KV cache arrives.
+The initialisation strategy is deliberate:
+- **A is initialised with Kaiming-uniform (random)** — ensures gradients flow from the first training step
+- **B is initialised to zeros** — so `B·A = 0` at initialisation, meaning the model starts training from the exact pre-trained behaviour with no initial perturbation
 
-For a TTFT budget of 500ms with 200ms prefill time, you have ~300ms for the transfer:
+This means fine-tuning with LoRA begins from the same point as fine-tuning without it — you aren't "restarting" the model, you're adding a trainable correction layer on top of frozen weights.
+
+### What's In an Adapter Checkpoint
+
+An adapter checkpoint from HuggingFace PEFT consists of two files:
+
 ```
-Required bandwidth = 1.34 GB / 0.3s ≈ 4.5 GB/s minimum
+adapter_config.json          ← LoRA configuration
+adapter_model.safetensors    ← A and B weight tensors
 ```
 
-| Network Type | Bandwidth | Transfer Time (1.34 GB) | Verdict |
+The `adapter_config.json` contains:
+```json
+{
+  "base_model_name_or_path": "Qwen/Qwen3-0.6B",
+  "r": 8,
+  "lora_alpha": 32,
+  "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj",
+                     "gate_proj", "up_proj", "down_proj"],
+  "bias": "none"
+}
+```
+
+The weight keys in `adapter_model.safetensors` follow the pattern:
+```
+base_model.model.model.layers.{layer_idx}.{module}.lora_A.weight  →  A matrix [r, in_dim]
+base_model.model.model.layers.{layer_idx}.{module}.lora_B.weight  →  B matrix [out_dim, r]
+```
+
+This is the format that `LoRAAdapter._load_weights()` in Layer 20 parses. PEFT's key naming convention is the standard that all adapter checkpoints on HuggingFace Hub follow.
+
+---
+
+## 3. The Serving Problem: One Base Model, One Thousand Adapters
+
+With the LoRA math understood, the serving problem becomes precise. You have one base model (14 GB) and N adapters (50–200 MB each). You want to serve requests, where each request specifies which adapter (or no adapter — just the base model) to use. How do you handle this at scale?
+
+### Approach 1: Merge Weights (Naïve)
+
+The simplest approach: before serving, merge each adapter into its own copy of the base model.
+
+```
+W = W₀ + B · A · (α/r)
+```
+
+Then serve each merged model independently. This works correctly — the forward pass becomes a single `x @ W.T` — but it completely undoes the storage savings of LoRA. You are back to 14 GB per adapter. For 100 adapters, that is 1.4 TB of VRAM across 100 GPU instances.
+
+Furthermore, merged serving limits batch sizes: requests for different adapters cannot be combined into the same batch, because each GPU instance now holds a different model.
+
+### Approach 2: Separate Computation (Efficient)
+
+A better decomposition:
+
+```
+h = W₀ · x  +  B · A · x · (α/r)
+  = (base contribution)  +  (adapter contribution)
+```
+
+Compute the base contribution once for the entire batch — all tokens, regardless of which adapter they need. Then compute the adapter contribution separately, per-adapter. Add the two.
+
+This has two immediate benefits:
+
+1. **The base model is held once** — regardless of how many adapters are active. 14 GB of base weights, loaded once.
+2. **The base forward pass can be batched across all requests simultaneously** — token A needs adapter 1, token B needs adapter 2, but both execute the same `W₀ · x` computation in the same matrix multiply.
+
+The adapter contribution computation is the remaining problem: how do you efficiently compute `B_n · A_n · x` for each token in a batch where different tokens need different adapter pairs?
+
+> "There are two methods to compute h using LoRA... approach 2) seems to be more suitable for a multi-task/tenancy scenario, as we can compute the left term once, the right term for every adapter n, and sum them as needed." — João Moura (AWS), 2024
+
+### Why the Adapter Computation Is the Hard Part
+
+A naive implementation iterates over adapters and launches a separate matrix multiply for each group of tokens sharing that adapter. Each kernel launch has overhead. With 50 adapters and diverse access patterns, the GPU launches 50 separate matrix multiplications per layer, each tiny, each with its own scheduling overhead. GPU utilisation collapses.
+
+This is precisely the problem that the Punica project solved with its SGMV kernel.
+
+---
+
+## 4. The SGMV Kernel: Batching Across Different Adapters
+
+The key insight from Punica (MLSys 2024) is that the adapter computation can be fused across all adapters in a batch — not executed separately per adapter.
+
+### Segmented Gather Matrix-Vector Multiplication (SGMV)
+
+For a batch with tokens using different adapters:
+
+```
+Token 0: adapter (A₁, B₁)  →  delta₀ = x₀ @ A₁.T @ B₁.T * scale
+Token 1: adapter (A₂, B₂)  →  delta₁ = x₁ @ A₂.T @ B₂.T * scale
+Token 2: adapter (A₁, B₁)  →  delta₂ = x₂ @ A₁.T @ B₁.T * scale
+Token 3: (base only)        →  delta₃ = 0
+```
+
+SGMV executes all of these in a single kernel launch:
+1. **Gather:** map each token to its adapter weight matrices
+2. **Segment:** group tokens sharing the same adapter (tokens 0 and 2 above both use A₁/B₁)
+3. **Multiply:** compute all segments' matrix products in one fused operation, sharing CUDA thread blocks efficiently across segments
+
+The result: GPU utilisation stays high regardless of how many distinct adapters are in the batch. SGMV treats heterogeneous adapter computation as a single parallelisable operation, not as N separate operations.
+
+### What the Benchmark Says
+
+Punica's evaluation on a single A100 80GB with LLaMA-7B:
+
+> "Punica achieves 12× higher throughput in serving multiple LoRA models compared to state-of-the-art LLM serving systems while only adding 2ms latency per token." — Punica (MLSys 2024)
+
+The 12× throughput gain comes from two sources:
+1. The base model GEMM is computed once for the full batch (not once per adapter)
+2. SGMV eliminates per-adapter kernel launch overhead — all adapter deltas are computed in one fused launch
+
+The 2ms latency overhead is nearly constant regardless of the number of adapters in the batch. You pay 2ms extra per token for the SGMV computation; the actual adapter count doesn't change that cost significantly.
+
+### SGMV vs BGMV
+
+Later work introduced a variant called BGMV (Batched Gather Matrix-Vector Multiplication), optimised specifically for the decode phase:
+
+| Kernel | Optimised for | Used by |
+|---|---|---|
+| SGMV | Prefill (batch of tokens, long sequences) | LoRAX, SGLang Triton backend |
+| BGMV | Decode (one token per request) | vLLM |
+
+Both eliminate the per-kernel-launch overhead for multi-adapter batching. SGMV is better for long prompt processing; BGMV is better for single-token autoregressive steps.
+
+### The Masked Alternative (Layer 20)
+
+Layer 20 implements a simpler — but correct — alternative to SGMV:
+
+```python
+out = base_output + lora_delta * lora_mask   # mask ∈ {0.0, 1.0} per token
+```
+
+This always computes `lora_delta` for every token (even base-model tokens, whose results are zeroed by the mask), while SGMV skips computation for base-model tokens entirely. For a batch where 10% of tokens need a LoRA adapter, the masked approach wastes 90% of the extra matmuls. SGMV skips the wasted computation.
+
+The masked approach is significantly simpler to implement (10 lines vs ~500 lines of custom CUDA) and completely correct for the single-adapter use case. SGMV is the production upgrade for multi-adapter batching at scale.
+
+---
+
+## 5. Three Pillars of Production Multi-Adapter Serving
+
+With Punica's SGMV kernel solving the compute problem, the remaining challenges are operational: how do you manage an adapter pool that may contain thousands of adapters without running out of VRAM or creating unacceptable cold-start latency?
+
+LoRAX (Predibase's open-source inference server, originally forked from HuggingFace TGI) assembled all of these components into a production-ready architecture. Its design rests on three pillars.
+
+### Pillar 1: Dynamic Adapter Loading
+
+Rather than loading all adapters at server startup, LoRAX loads adapters **just-in-time**:
+
+1. Server starts with only the base model in VRAM
+2. When a request specifies `adapter_id="my-fine-tuned-model"`, the loader checks its registry
+3. If the adapter is already in VRAM: immediate processing
+4. If not: fetch from HuggingFace Hub, S3, or local disk; queue the request; process once loaded
+
+The fetch is non-blocking: while adapter A is loading, requests for other already-loaded adapters continue processing uninterrupted. A LoRA adapter is typically 10–200 MB, so loading takes hundreds of milliseconds — far less than the minutes required for a full model. The server feels responsive even during cold starts.
+
+> "The time taken to load an adapter is a function of its size. Since LoRA adapters are typically between 10MB and 200MB, the load time is measured in hundreds of milliseconds." — Neel Shah (Towards AI), 2026
+
+### Pillar 2: Tiered Weight Caching
+
+Memory management is the critical limiting factor for a high-density inference server. A three-tier cache hierarchy manages adapter weight lifetime:
+
+| Tier | Storage | Policy | Speed |
 |---|---|---|---|
-| 1 GbE | 125 MB/s | **10.7 seconds** | Completely unusable |
-| 10 GbE | 1.25 GB/s | **1.07 seconds** | Too slow |
-| 25 GbE | 3.125 GB/s | **0.43 seconds** | Borderline |
-| 100 GbE | 12.5 GB/s | **0.11 seconds** | Acceptable |
-| InfiniBand HDR | 25 GB/s | **54 ms** | Good |
-| NVLink (within node) | 600 GB/s | **2.2 ms** | Ideal |
+| **Hot** | GPU VRAM | Currently active | Immediate |
+| **Warm** | Host DRAM | LRU eviction from GPU | ~10ms reload |
+| **Cold** | NVMe / S3 | Full adapter catalog | ~100ms–seconds |
 
-**The takeaway:** standard internet connections are unusable. You need co-located workers on the same rack with InfiniBand or NVLink.
+When GPU VRAM is full and a new adapter is needed, the Least Recently Used (LRU) adapter is evicted from VRAM to DRAM. If DRAM is also full, adapters move from DRAM to disk. A warm start (DRAM → VRAM) is nearly instantaneous compared to a cold start (disk or network download → VRAM).
 
-### Is the Transfer Worth It?
+This tiered hierarchy prevents OOM errors while enabling a server to hold, in principle, thousands of adapters — as many as fit on disk — across all three tiers simultaneously. The GPU tier is limited by remaining VRAM after the base model and KV cache are allocated.
 
-The KV transfer overhead (27–107ms at RDMA speeds) is paid on every request. The benefit it replaces — queuing delay from prefill-decode interference — is not a constant; it grows with load.
+### Pillar 3: Continuous Multi-Adapter Batching
 
-DistServe P99 latency measurements show 2×+ improvement with disaggregation. This is because the interference problem creates **tail latency spikes**: when a large prefill enters the batch, active decode requests can stall for 200–500ms. The 27–107ms transfer cost replaces these 200–500ms stall events.
+The third pillar extends continuous batching — the technique that keeps GPUs busy by processing requests as they arrive rather than waiting for full batch windows — to work across multiple adapters.
 
-**Perplexity's further optimisation — layer-pipelined transfer:** Rather than waiting for the entire KV cache to arrive before decode begins, Perplexity's implementation transfers the cache layer by layer. The decode worker starts processing layer 0's attention while layers 1–79 are still in transit. This reduces the effective TTFT addition well below the raw bandwidth calculation.
+In standard continuous batching, the engine maintains a running batch of requests and slots new arrivals in as compute is available. Multi-adapter continuous batching extends this with a **heterogeneous scheduler**:
 
----
+1. A fair scheduler marks a subset of adapters as "active" at any given time
+2. Requests from active adapters are drained from their queues and combined into a single heterogeneous batch
+3. The SGMV kernel computes all adapter deltas in one pass, with a mathematical mask ensuring each token uses the correct adapter's weights
+4. After a configurable time window, the scheduler rotates: a different set of adapters becomes active, ensuring all adapters eventually get served
 
-## 8. The Handshake: How SGLang Moves the KV Cache
+> "Requests from active adapters are drained from their queues and combined into a single batch. A mathematical mask is applied during the computation of activations to ensure that each input sequence is processed by the correct adapter weights." — Neel Shah (Towards AI), 2026
 
-The most important implementation detail in PD disaggregation is the **handshake protocol**: the sequence of steps through which a prefill server and a decode server coordinate to transfer the KV cache safely and efficiently.
-
-SGLang's design (as implemented for the 96 H100 DeepSeek deployment):
-
-```
-Step 1: Decode Server pre-allocates KV cache pages for the incoming request
-         → sends KV page indices to the Prefill Server
-
-Step 2: Prefill Server receives the KV page indices
-         → runs the model forward pass (prefill)
-         → writes KV cache directly into the Decode Server's
-           pre-allocated pages (via RDMA / Mooncake or NIXL)
-         → sends completion notification
-
-Step 3: Decode Server receives the KV cache
-         → begins autoregressive generation
-         → streams output tokens back to client
-```
-
-**The critical design choice:** the Decode Server pre-allocates **before** the Prefill Server begins. This prevents a race condition where the Decode Server might not have space when the Prefill Server finishes. The allocation happens first, then prefill runs, then the transfer fills the pre-allocated pages.
-
-**Two transfer backend options in SGLang:**
-
-- **Mooncake** (recommended for production): RDMA-based, optimised for InfiniBand and NVLink. Uses GPUDirect RDMA to transfer KV cache data directly between GPU HBM on different nodes without CPU involvement.
-- **NIXL** (network-agnostic): NVIDIA Inference Xfer Library, supports UCX and LIBFABRIC backends. Works with any high-speed interconnect that UCX supports.
+The mask mentioned here is the production version of Layer 20's `lora_mask` approach — extended to N adapters and powered by SGMV instead of dense matmuls.
 
 ---
 
-## 9. Launching a Disaggregated Cluster
+## 6. The Live Benchmark: 50 Adapters at the Cost of One
 
-SGLang uses a single `launch_server` command with a `--disaggregation-mode` flag to convert a standard inference server into a phase-specific worker.
+The theoretical claims from Punica are compelling. The most concrete empirical evidence comes from an end-to-end benchmark run by João Moura (AWS Solutions Architect) on Amazon SageMaker, published January 2024.
 
-### Minimal Setup: Single Node, Mooncake Backend
+### Setup
 
-```bash
-# 1. Install the transfer engine
-uv pip install mooncake-transfer-engine
+- **Model:** `mistralai/Mistral-7B-Instruct-v0.1`
+- **Adapter:** `vineetsharma/qlora-adapter-Mistral-7B-Instruct-v0.1-gsm8k` (grade school math, rank-8)
+- **Replication:** 50 copies of this adapter uploaded under different S3 prefixes (simulating 50 distinct adapters)
+- **Hardware:** AWS `ml.g5.xlarge` — one NVIDIA A10G 24 GB GPU
+- **Concurrency:** 20 parallel clients, 300 total requests
 
-# 2. Start the prefill worker (uses GPU 0)
-python -m sglang.launch_server \
-  --model-path meta-llama/Llama-3.1-8B-Instruct \
-  --disaggregation-mode prefill \
-  --port 30000 \
-  --disaggregation-ib-device mlx5_roce0
+### What the Test Shows
 
-# 3. Start the decode worker (uses GPU 1 on the same node)
-python -m sglang.launch_server \
-  --model-path meta-llama/Llama-3.1-8B-Instruct \
-  --disaggregation-mode decode \
-  --port 30001 \
-  --base-gpu-id 1 \
-  --disaggregation-ib-device mlx5_roce0
+The benchmark compares two traffic patterns:
+1. **Single adapter:** all 300 requests use the same adapter
+2. **Random access:** each request randomly selects one of the 50 adapters
 
-# 4. Start the router (the client-facing entry point)
-python -m sglang_router.launch_router \
-  --pd-disaggregation \
-  --prefill http://127.0.0.1:30000 \
-  --decode http://127.0.0.1:30001 \
-  --host 0.0.0.0 --port 8000
+The result:
+
+```
+Single Adapter:
+  Total Time: 42.34s  |  Average Latency: 2.80s  |  Throughput: 7.09 req/s
+
+50 Adapters (random access):
+  Total Time: 42.60s  |  Average Latency: 2.82s  |  Throughput: 7.04 req/s
 ```
 
-Clients send requests to port 8000 (the router). The router dispatches to the prefill worker and the decode worker; clients never address either worker directly.
+**Virtually identical performance.** Serving 50 different adapters randomly in parallel costs almost the same as serving one adapter repeatedly.
 
-### Minimal Setup: Single Node, NIXL Backend
+> "We would effectively now be serving 50 different models on a single A10G." — João Moura, 2024
 
-```bash
-# 1. Install NIXL
-pip install nixl
+This is the central empirical claim of multi-adapter serving, validated end-to-end on production hardware. The Punica/SGMV kernel's 12× throughput claim is confirmed in a realistic workload.
 
-# 2. Start prefill worker with NIXL
-python -m sglang.launch_server \
-  --model-path meta-llama/Llama-3.1-8B-Instruct \
-  --disaggregation-mode prefill \
-  --port 30000 \
-  --disaggregation-transfer-backend nixl
+### Why It Works: The Arithmetic
 
-# 3. Start decode worker with NIXL
-python -m sglang.launch_server \
-  --model-path meta-llama/Llama-3.1-8B-Instruct \
-  --disaggregation-mode decode \
-  --port 30001 --base-gpu-id 1 \
-  --disaggregation-transfer-backend nixl
+The base model GEMM dominates compute. On a Mistral-7B with a 4096-token context, each forward pass is dominated by the 32 attention layers × 32 heads × 4096 dimensions = billions of multiply-adds in `W₀ · x`. The LoRA delta (`B · A · x`) is a tiny fraction of this: rank-8 adds `2 × 4096 × 8 = 65,536` multiply-adds per layer, against `4096 × 4096 × 32 = 536 million` for the base layer. The LoRA overhead is 0.012% of the base model computation.
 
-# 4. Start the router (same as above)
-python -m sglang_router.launch_router \
-  --pd-disaggregation \
-  --prefill http://127.0.0.1:30000 \
-  --decode http://127.0.0.1:30001 \
-  --host 0.0.0.0 --port 8000
-```
-
-### Key CLI Flags Reference
-
-| Flag | Worker | What it does |
-|---|---|---|
-| `--disaggregation-mode prefill` | Prefill | This server handles prefill only; never generates tokens |
-| `--disaggregation-mode decode` | Decode | This server handles decode only; requires KV cache from prefill |
-| `--disaggregation-transfer-backend mooncake` | Both | Use Mooncake RDMA engine for KV transfer |
-| `--disaggregation-transfer-backend nixl` | Both | Use NIXL (UCX/LIBFABRIC) for KV transfer |
-| `--disaggregation-ib-device mlx5_roce0` | Both | Which RDMA NIC to use for KV transfer |
-| `--pd-disaggregation` | Router | Enable PD-aware routing in the router |
-| `--max-running-requests 128` | Decode | Cap concurrent decode requests to avoid OOM |
-
-### Environment Variables for Tuning
-
-**Prefill server:**
-
-| Variable | Purpose | Default |
-|---|---|---|
-| `SGLANG_DISAGGREGATION_QUEUE_SIZE` | Parallel transfer queues (allows simultaneous KV transfers to multiple decode instances) | `4` |
-| `SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT` | Seconds to wait for decode server to send KV page indices | `300` |
-| `SGLANG_DISAGGREGATION_THREAD_POOL_SIZE` | Worker threads for KV transfer per TP rank | Auto (based on CPU count) |
-
-**Decode server:**
-
-| Variable | Purpose | Default |
-|---|---|---|
-| `SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL` | How often to health-check prefill servers (sec) | `5.0` |
-| `SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE` | Consecutive failures before marking prefill offline | `2` |
-| `SGLANG_DISAGGREGATION_WAITING_TIMEOUT` | Seconds to wait for KV cache arrival after initialization | `300` |
-
-**For NVL72 deployments (NVLink transport):**
-
-```bash
-export SGLANG_MOONCAKE_CUSTOM_MEM_POOL=NVLINK
-export MC_FORCE_MNNVL=True
-```
-
-**For heterogeneous TP (prefill TP ≠ decode TP):**
-
-```bash
-# Enable GPU staging buffer for better throughput when TP sizes differ
-export SGLANG_DISAGG_STAGING_BUFFER=1
-export SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB=64   # per-worker, prefill side
-export SGLANG_DISAGG_STAGING_POOL_SIZE_MB=4096    # ring buffer, decode side
-```
-
-> **Note:** The GPU staging buffer (2–5× throughput improvement at high concurrency) is only for non-MLA models (GQA/MHA). Do **not** enable for DeepSeek-V2/V3, which use MLA architecture.
-
-### What the Router Does
-
-The `sglang_router` with `--pd-disaggregation` is the client-facing entry point. It:
-- Routes each incoming request to a prefill worker
-- Waits for prefill completion
-- Dispatches the KV cache handoff to an available decode worker
-- Streams the decode output back to the client
-
-Clients always target the router. They never interact with prefill or decode workers directly.
+SGMV's job is to compute that 0.012% correctly per token without the overhead of separate kernel launches. Once it succeeds, the adapter count becomes irrelevant to throughput.
 
 ---
 
-## 10. Production Evidence at Scale
+## 7. Serving LoRA Adapters in SGLang
 
-Disaggregated serving is not a research prototype or an engineering curiosity. As of early 2026, it is running in production at multiple companies handling hundreds of millions of queries per month.
+SGLang's LoRA serving system incorporates both S-LoRA and Punica techniques, providing a production-ready multi-adapter serving stack built directly on the same framework as Layer 20's minimal implementation.
 
-### Perplexity AI: 435 Million Search Queries per Month
+### Enabling LoRA: The Key Arguments
 
-Perplexity AI — an AI-powered search engine — handles 435+ million queries per month using NVIDIA H100 SXM GPUs and Kubernetes, serving 20+ AI models simultaneously (Llama-3.1 8B, 70B, 405B, embedding models, and classifier models).
+```bash
+python3 -m sglang.launch_server \
+    --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
+    --enable-lora \
+    --lora-paths lora0=algoprog/fact-generation-llama-3.1-8b-instruct-lora \
+    --max-loras-per-batch 2 \
+    --lora-eviction-policy lru
+```
 
-The Perplexity inference team's stated production outcome:
-
-> "In terms of inference serving middleware, the team is actively collaborating with the NVIDIA Triton engineering team to deploy disaggregating serving, a groundbreaking technique that separates the prefill and decode inference phases of an LLM workflow onto separate NVIDIA GPUs. This technique significantly boosts overall system throughput while meeting SLAs, translating to lower cost per token. Additionally, this technique gives Perplexity the flexibility to use **different NVIDIA GPU products for each inference phase** given its specific hardware resource requirements." — NVIDIA Spotlight, December 2024
-
-**What this confirms:**
-1. Disaggregated serving is in active production deployment — not evaluation — at a 435M-query/month service.
-2. It "significantly boosts overall system throughput while meeting SLAs."
-3. Hardware heterogeneity (different GPU SKUs for prefill and decode) is a real production benefit already being leveraged.
-
-Cost impact: by hosting the Related-Questions feature (a single product feature) on internal GPUs using optimised serving, Perplexity estimates **approximately $1 million annually saved** compared to third-party API costs.
-
-### SGLang + DeepSeek-V3 on 96 H100 GPUs
-
-The SGLang team (LMSYS) published the most detailed large-scale PD disaggregation deployment in May 2025: DeepSeek-V3 (671B parameters, MoE architecture) deployed across 12 nodes × 8 H100 GPUs.
-
-**Deployment configuration:**
-- **Total cluster**: 96 H100 GPUs across 12 nodes
-- **Prefill pool**: 3 nodes (24 GPUs) — 1:3 prefill-to-decode ratio
-- **Decode pool**: 9 nodes (72 GPUs)
-- **Model**: DeepSeek-V3 — 671B parameters, 256 experts, MLA attention
-- **KV transfer**: Mooncake + InfiniBand
-
-**Results:**
-
-| Metric | Value |
+| Argument | What it controls |
 |---|---|
-| Input throughput per node | **52,300 tokens/second** |
-| Output throughput per node | **22,300 tokens/second** |
-| Input sequence length | 2,000 tokens |
+| `--enable-lora` | Enable LoRA support (auto-set if `--lora-paths` is provided) |
+| `--lora-paths` | Adapters to load at startup; format: `name=path_or_hf_id` |
+| `--max-loras-per-batch` | Maximum adapters active simultaneously in GPU pool. Affects VRAM reservation. Default: 8 |
+| `--max-loaded-loras` | Cap on adapters in CPU memory (must be ≥ `max-loras-per-batch`) |
+| `--lora-eviction-policy` | `lru` (default) or `fifo` — which adapter leaves GPU pool when full |
+| `--lora-backend` | `triton` or `csgmv` (Chunked SGMV) — the kernel used for adapter delta computation |
+| `--max-lora-rank` | Maximum rank to reserve GPU buffer for. Needed for dynamic loading of unknown adapters |
+| `--lora-target-modules` | Projection modules to enable LoRA on; set `all` for all supported modules |
 
-> "To the best of our knowledge, this is the highest reported throughput for DeepSeek-V3 serving at that time." — SGLang Team, May 2025
+### Serving Single vs Multiple Adapters
 
-**Why PD disaggregation was mandatory for this workload — not optional:** DeepSeek-V3 uses Mixture-of-Experts (MoE) with 256 experts, only 8 activated per token. The expert parallelism (EP) communication library (DeepEP) uses different dispatch patterns for prefill ("normal" mode: high-throughput for large batches) and decode ("low-latency" mode: minimises dispatch latency for single-token batches). These patterns are incompatible on the same GPU workers. PD disaggregation is the only way to run each phase with its optimal dispatch pattern. For MoE models at this scale, disaggregation is not an optimisation — it is a correctness requirement.
+**Single adapter, per-request selection (Native API):**
 
-**The 3:9 prefill-to-decode GPU ratio** is the production tuning point for DeepSeek-V3 at this scale. Decode is more resource-hungry than prefill because it runs continuously (every token, one by one) while prefill is bursty (large batch, then done).
+```python
+import requests
 
-### Additional Production Adopters
+json_data = {
+    "text": [
+        "List 3 countries and their capitals.",  # uses lora0
+        "List 3 countries and their capitals.",  # uses base model
+    ],
+    "sampling_params": {"max_new_tokens": 32, "temperature": 0},
+    "lora_path": ["lora0", None],  # None → base model
+}
+response = requests.post("http://localhost:{port}/generate", json=json_data)
+```
 
-| Company | Stack | Scale |
-|---|---|---|
-| Perplexity AI | NVIDIA Dynamo Triton + TensorRT-LLM | 435M queries/month |
-| Meta | vLLM with disaggregated serving | Production |
-| LinkedIn | vLLM with disaggregated serving | Production |
-| Mistral | vLLM with disaggregated serving | Production |
-| HuggingFace | vLLM with disaggregated serving | Production |
-| Moonshot AI (Kimi) | SGLang + Mooncake | Production (Kimi serving) |
+**Multiple adapters in the same batch:**
 
-NVIDIA built its entire Dynamo inference framework (announced GTC 2025) around disaggregated serving as the default architecture for enterprise deployments.
+```python
+json_data = {
+    "text": ["List 3 countries.", "Write a Python function."],
+    "lora_path": ["lora0", "lora1"],  # different adapter per sequence
+}
+```
+
+This is the mixed-batch capability Layer 20 implements at the request level: different tokens in the same batch can use different adapters (or no adapter). SGLang uses SGMV/Triton kernels for the adapter computation; Layer 20 uses the dense float-mask approach.
+
+**OpenAI-compatible API (uses `model` field as adapter selector):**
+
+```python
+from openai import OpenAI
+client = OpenAI(api_key="EMPTY", base_url="http://localhost:{port}/v1")
+
+# Use adapter: model="base_model_name:adapter_name"
+response = client.chat.completions.create(
+    model="meta-llama/Meta-Llama-3.1-8B-Instruct:lora0",
+    messages=[{"role": "user", "content": "List 3 countries"}]
+)
+
+# Use base model: model="base_model_name"
+response = client.chat.completions.create(
+    model="meta-llama/Meta-Llama-3.1-8B-Instruct",
+    messages=[{"role": "user", "content": "List 3 countries"}]
+)
+```
+
+The `model:adapter` colon syntax routes to the named adapter. No adapter suffix routes to the base model. This is how Layer 20's `lora_id` field maps to the production API.
+
+### Dynamic Loading and Unloading at Runtime
+
+Rather than specifying all adapters at startup, SGLang supports loading and unloading adapters while the server runs:
+
+```python
+# Load a new adapter (e.g., just pushed a new fine-tune)
+requests.post(f"http://localhost:{port}/load_lora_adapter", json={
+    "lora_name": "new_fine_tune",
+    "lora_path": "huggingface_user/my-new-adapter",
+})
+
+# Unload an adapter (free its VRAM/DRAM slot)
+requests.post(f"http://localhost:{port}/unload_lora_adapter", json={
+    "lora_name": "old_adapter",
+})
+```
+
+**Important:** When planning to dynamically load adapters after server startup, specify `--max-lora-rank` and `--lora-target-modules` at launch. Without these, SGLang infers the maximums from `--lora-paths` at startup and may reject later-loaded adapters with larger ranks or different target modules.
+
+### Memory Architecture: What `max-loras-per-batch` Controls
+
+SGLang pre-allocates a GPU memory pool for adapter weights at startup:
+
+```
+GPU VRAM allocation:
+  Base model weights:       fixed (e.g., 16 GB for LLaMA-8B)
+  KV cache:                 configurable (largest remaining)
+  LoRA GPU pool:            max_loras_per_batch × max_lora_rank × module_dims × 2
+```
+
+The LoRA GPU pool holds up to `max_loras_per_batch` adapter A/B matrices simultaneously. When a new adapter is needed and the pool is full, the LRU adapter's slot is reclaimed. The evicted adapter's weights move to CPU DRAM (warm cache), not discarded.
+
+Layer 20 is the degenerate case: `max_loras_per_batch = 1`, never evicted, loaded once at startup.
+
+### Tensor Parallelism
+
+SGLang follows S-LoRA's tensor parallelism strategy for multi-GPU deployments:
+
+- Column-parallel modules (`q_proj`, `k_proj`, `v_proj`, `gate_proj`, `up_proj`): LoRA B is column-sharded; LoRA A is replicated
+- Row-parallel modules (`o_proj`, `down_proj`): LoRA A is row-sharded; LoRA B is replicated
+
+This ensures each GPU can compute its portion of the adapter delta independently, with the same all-reduce cost as the base model's TP communication.
 
 ---
 
-## 11. When Disaggregation Makes Things Worse
+## 8. Serving LoRA Adapters in vLLM
 
-The 96 H100 result and the Perplexity case study are real, but they come with conditions. Disaggregation is not universally beneficial — applied to the wrong workload, it can **degrade performance by 20–30%**.
+vLLM's multi-LoRA implementation uses a different API design from SGLang — request-level `LoRARequest` objects for offline inference, and the `model` field in API requests for online serving.
 
-> "If your workload is too small, or your GPU setup isn't tuned for this approach, performance can drop by 20–30% in our tests." — BentoML
+### Offline Inference with `LoRARequest`
 
-### Three Failure Modes
+```python
+from vllm import LLM, SamplingParams
+from vllm.lora.request import LoRARequest
+from huggingface_hub import snapshot_download
 
-**Failure Mode 1: Short prompts + short outputs — transfer overhead exceeds savings**
+# Download adapter locally
+sql_lora_path = snapshot_download(repo_id="jeeejeee/llama32-3b-text2sql-spider")
 
-If your median prompt is 256 tokens and output is 50 tokens:
-- KV cache for 256 tokens (Llama-70B): ~83 MB
-- Transfer time at 100 GbE: ~7ms
-- Prefill time for 256 tokens: ~20ms
-- Decode time for 50 tokens: ~500ms
+# Instantiate with LoRA support enabled
+llm = LLM(model="meta-llama/Llama-3.2-3B-Instruct", enable_lora=True)
 
-The interference problem barely exists for a 20ms prefill. The routing overhead, network transfer, and coordination between servers adds more latency than the interference ever would. Local prefill on the decode worker takes fewer total milliseconds.
+# Generate with a specific adapter
+sampling_params = SamplingParams(temperature=0, max_tokens=256)
+outputs = llm.generate(
+    prompts=["Write a SQL query to answer: ..."],
+    sampling_params=sampling_params,
+    lora_request=LoRARequest("sql_adapter", 1, sql_lora_path),
+    # Arguments: (human_name, unique_int_id, adapter_path)
+)
+```
 
-**Failure Mode 2: High prefix cache hit rate — local is faster**
+The `LoRARequest` object is passed per `generate()` call. For mixed batches where different prompts need different adapters, see `examples/offline_inference/multilora_inference.py`.
 
-For multi-turn conversations where the decode worker already holds the KV cache from the previous turn, incremental prefill is tiny (only the new tokens, not the full context). Sending the few new tokens' KV cache from a prefill worker over the network wastes bandwidth on data that's essentially already local.
+### Online Serving with the OpenAI-Compatible API
 
-For workloads with >80% prefix cache hit rates, the decode worker should run prefill locally for those requests — the network round-trip always adds latency that the cache hit savings can't justify.
+```bash
+vllm serve meta-llama/Llama-3.2-3B-Instruct \
+    --enable-lora \
+    --lora-modules sql-lora=jeeejeee/llama32-3b-text2sql-spider
+```
 
-**Failure Mode 3: Too few GPUs — scheduling overhead dominates**
+Querying with the adapter:
+```bash
+curl http://localhost:8000/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "sql-lora", "prompt": "Write a SQL query...", "max_tokens": 256}'
+```
 
-With fewer than ~16 GPUs total, maintaining two separate pools creates operational complexity without sufficient throughput to amortise it. The scheduling overhead of the two-pool architecture — health checks, handshake coordination, queue management — exceeds the utilisation gains from separating phases.
+The `model` field selects the adapter — the same field used for base model selection in standard OpenAI API calls. Using the base model name routes to the base model; using a registered adapter name routes to that adapter. Requests are processed in parallel.
 
-### The Anti-Patterns
+### Dynamic Loading at Runtime
 
-| Scenario | What to use instead |
+```bash
+# Enable runtime LoRA loading
+export VLLM_ALLOW_RUNTIME_LORA_UPDATING=True
+
+# Load a new adapter
+curl -X POST http://localhost:8000/v1/load_lora_adapter \
+  -H "Content-Type: application/json" \
+  -d '{"lora_name": "new_adapter", "lora_path": "/path/to/adapter"}'
+
+# Unload an adapter
+curl -X POST http://localhost:8000/v1/unload_lora_adapter \
+  -H "Content-Type: application/json" \
+  -d '{"lora_name": "new_adapter"}'
+```
+
+### LoRAResolver Plugins (Fully Automatic Loading)
+
+vLLM supports LoRAResolver plugins that automatically resolve and load adapters on demand — no explicit load call needed. When a request arrives with an unknown `model` name, the resolver is consulted:
+
+```python
+from vllm.lora.resolver import LoRAResolver, LoRAResolverRegistry
+from vllm.lora.request import LoRARequest
+
+class S3LoRAResolver(LoRAResolver):
+    async def resolve_lora(self, base_model_name, lora_name):
+        local_path = self.download_from_s3(lora_name)
+        return LoRARequest(lora_name=lora_name, lora_path=local_path,
+                           lora_int_id=abs(hash(lora_name)))
+
+LoRAResolverRegistry.register_resolver("s3_resolver", S3LoRAResolver())
+```
+
+With a resolver registered, every new model name is automatically fetched and loaded. This is the production realisation of LoRAX's "dynamic adapter loading" pillar, implemented as an extensible plugin.
+
+### In-Place Adapter Reloading
+
+For Reinforcement Learning pipelines where adapters are continuously updated and re-served without downtime:
+
+```bash
+curl -X POST http://localhost:8000/v1/load_lora_adapter \
+  -H "Content-Type: application/json" \
+  -d '{"lora_name": "rl-adapter", "lora_path": "/path/to/updated/adapter", "load_inplace": true}'
+```
+
+`load_inplace=true` replaces the existing weights in-place — the adapter name stays registered, but its weights are swapped to the new checkpoint. The server never needs to restart.
+
+---
+
+## 9. The HuggingFace PEFT Checkpoint Format
+
+Every adapter on HuggingFace Hub — including `phh/Qwen3-0.6B-TLDR-Lora` used in Layer 20 — follows the PEFT checkpoint format. Understanding this format is essential for loading adapters correctly and for verifying adapter implementations.
+
+### Files in a PEFT Adapter Checkpoint
+
+```
+adapter_config.json
+adapter_model.safetensors   (sometimes adapter_model.bin for older checkpoints)
+README.md                   (optional)
+```
+
+### `adapter_config.json` — The Configuration
+
+```json
+{
+  "base_model_name_or_path": "Qwen/Qwen3-0.6B",
+  "peft_type": "LORA",
+  "r": 8,
+  "lora_alpha": 32,
+  "lora_dropout": 0.05,
+  "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj",
+                      "gate_proj", "up_proj", "down_proj"],
+  "bias": "none",
+  "task_type": "CAUSAL_LM"
+}
+```
+
+Key fields:
+- `r`: rank — controls adapter size and expressiveness
+- `lora_alpha`: the scaling numerator; effective scale = `lora_alpha / r`
+- `target_modules`: which projection layers have LoRA applied
+
+These are the fields that `LoRAAdapter.__init__()` reads from `adapter_config.json`.
+
+### `adapter_model.safetensors` — The Weight Tensors
+
+Keys follow a strict naming convention:
+
+```
+base_model.model.model.layers.{layer_idx}.self_attn.q_proj.lora_A.weight  →  shape [r, in_dim]
+base_model.model.model.layers.{layer_idx}.self_attn.q_proj.lora_B.weight  →  shape [out_dim, r]
+base_model.model.model.layers.{layer_idx}.mlp.gate_proj.lora_A.weight     →  shape [r, in_dim]
+base_model.model.model.layers.{layer_idx}.mlp.gate_proj.lora_B.weight     →  shape [out_dim, r]
+...
+```
+
+The structure is:
+- `base_model.model.` — PEFT prefix (always present)
+- `model.layers.{layer_idx}.` — model architecture path
+- `{component}.{module_name}.` — e.g., `self_attn.q_proj.`
+- `lora_A.weight` or `lora_B.weight`
+
+`LoRAAdapter._load_weights()` splits each key on `.`, finds `lora_A` or `lora_B`, extracts the layer index and module name, and stores the tensor in a nested dict `{layer_idx: {module_name: tensor}}`.
+
+### Loading and Using a PEFT Adapter for Inference
+
+The standard PEFT inference workflow:
+
+```python
+from transformers import AutoModelForCausalLM
+from peft import PeftModel
+
+# Load base model
+base_model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-0.6B")
+
+# Wrap with adapter
+peft_model = PeftModel.from_pretrained(base_model, "phh/Qwen3-0.6B-TLDR-Lora")
+peft_model.eval()
+
+# Inference — adapter is applied automatically
+outputs = peft_model(**inputs)
+```
+
+This is the ground truth that `verify_lora.py` in Layer 20 compares against.
+
+### Merging Adapters for Zero-Overhead Inference
+
+If you only need a single adapter and don't need to switch between adapters:
+
+```python
+# Merge adapter weights into base model permanently
+merged_model = peft_model.merge_and_unload()
+# merged_model is now a standard model with W = W₀ + B·A·scale
+# Zero inference overhead — one GEMM, not two
+# Cannot be unmerged
+```
+
+Merging is appropriate for production deployments with a fixed adapter. It is inappropriate for multi-adapter serving (Layer 20, LoRAX, SGLang production) because it destroys the base model's separability from the adapter.
+
+### Target Module Coverage
+
+| Coverage | Configuration | Use case |
+|---|---|---|
+| Minimal | `target_modules=["q_proj", "v_proj"]` | Fastest training; only attention value projection |
+| Attention | `target_modules=["q_proj", "k_proj", "v_proj", "o_proj"]` | Full attention coverage |
+| Full | `target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]` | All attention + MLP; strongest adaptation |
+| QLoRA-style | `target_modules="all-linear"` | Every linear layer; maximum parameter budget |
+
+`phh/Qwen3-0.6B-TLDR-Lora` uses full coverage (7 modules, rank-8). This is why `LoRAAdapter._load_weights()` must handle keys for all 7 module types.
+
+---
+
+## 10. Advanced Production Features
+
+### Structured Generation (JSON Mode)
+
+LLMs fine-tuned for extraction tasks — invoice parsing, entity recognition, API call generation — need their outputs to be valid JSON, not just probably-valid JSON. LoRAX integrates the Outlines library to enforce this:
+
+During token sampling, structured generation constrains the probability distribution so only valid tokens (tokens that keep the response on a valid JSON parse path) have nonzero probability. The result is 100% structural validity — the model can never produce malformed JSON.
+
+The value compounds with LoRA fine-tuning: the adapter learns which fields to extract and what their content should be, while structured generation guarantees the output format. Combined results from the LoRAX team:
+
+| Mode | Content accuracy | Structural validity |
+|---|---|---|
+| Base model | 50% | 90% |
+| LoRA adapter | 71% | 92% |
+| Adapter + structured generation | **80%** | **99.9%** |
+
+The adapter improves content; structured generation eliminates formatting failures. Both are necessary for a production extraction pipeline.
+
+### Lookahead LoRA: Speculative Decoding Without a Draft Model
+
+Standard speculative decoding uses a small "draft" model to predict the next 3–5 tokens, which the larger target model then verifies in parallel. It accelerates generation at the cost of maintaining and serving a separate draft model.
+
+LoRAX's Lookahead LoRA trains the adapter to do both: predict the next token (standard generation) and predict the following 2–3 tokens (draft prediction). The adapter itself becomes the speculative decoder. No separate model is needed.
+
+Reported throughput improvement: **2–3× over standard LoRA adapters**. This makes Lookahead LoRA particularly valuable for latency-sensitive applications like code completion and real-time chat, where Inter-Token Latency (ITL) is the critical metric.
+
+### Dynamic Adapter Management in vLLM (LoRAResolver + in-place reload)
+
+For production RL pipelines where adapters are updated continuously:
+
+1. **LoRAResolver** loads new adapters automatically when their names first appear in requests — no explicit `/load_lora_adapter` call required. Resolvers can pull from local directories, HuggingFace Hub, or custom backends like S3.
+
+2. **In-place reload** (`load_inplace=true`) swaps adapter weights without changing the adapter name — ongoing requests referencing that adapter name see the updated weights seamlessly.
+
+Together, these enable a pipeline where a training loop pushes new adapter checkpoints and the serving layer picks them up without any downtime or redeployment.
+
+---
+
+## 11. The KV Cache vs Adapter VRAM Trade-off
+
+Multi-adapter serving introduces a VRAM trade-off that does not exist for single-model serving: every adapter slot in the GPU pool consumes memory that would otherwise be available for the KV cache.
+
+### The Competition
+
+On an A10G 24 GB GPU serving Mistral-7B:
+
+```
+Base model weights: ~14 GB
+Available for KV + adapters: ~10 GB
+```
+
+With each rank-8 adapter occupying ~50 MB for a 7B model, the adapter pool costs are:
+
+| Active adapters | Adapter pool | KV cache budget | Max batch size (approx.) |
+|---|---|---|---|
+| 1 | ~50 MB | ~9.95 GB | ~100 requests |
+| 8 | ~400 MB | ~9.6 GB | ~96 requests |
+| 32 | ~1.6 GB | ~8.4 GB | ~84 requests |
+| 128 | ~6.4 GB | ~3.6 GB | ~36 requests |
+
+At 128 active adapters, you have 64% of the original KV cache budget. Batch size drops, GPU utilisation drops, throughput drops.
+
+> "Loading more adapters to GPU for concurrent execution means you will have less DRAM available to store the KV cache... the optimal configuration will be defined by the specific requirements of your workload." — João Moura, 2024
+
+### The Break-Even Point
+
+The trade-off has a break-even point that depends on your adapter access pattern. With diverse adapter access (each request uses a different adapter), more concurrent adapters in the GPU pool means fewer cold starts and lower average latency. With concentrated access (most requests use one of two adapters), keeping a small pool with large KV cache is better: batch sizes are higher and the two hot adapters are always warm.
+
+Practical guidance:
+
+- **If your adapter access distribution is heavily skewed** (80% of requests use 5% of adapters): keep `max_loras_per_batch` at 8–16. The hot adapters are always resident, cold adapters load on demand, and the large KV cache handles the high volume on the hot adapters.
+
+- **If your adapter access is nearly uniform** (each adapter gets equal traffic): larger pool sizes make sense, because every adapter has a reasonable chance of being requested in the next batch window.
+
+- **For Layer 20's single-adapter use case**: the pool always has exactly one adapter. The full remaining VRAM goes to KV cache. No trade-off exists.
+
+---
+
+## 12. Decision Framework: When Does Multi-LoRA Serving Pay Off?
+
+### The 4-Check Framework
+
+**Check 1 — How many adapters do you actually need?**
+
+If you need fewer than 4 adapters with predictable access patterns, consider separate dedicated servers with merged weights. Each merged model has zero inference overhead and the operational simplicity of single-model serving. The multi-adapter infrastructure pays off at 8+ adapters, and becomes clearly worthwhile at 50+.
+
+**Check 2 — What is your adapter access distribution?**
+
+Collect a day of production traffic and plot adapter request frequency. If your access is highly skewed (top 10 adapters handle 95% of traffic), you need a hot pool of ~10 adapters with LRU eviction for the long tail. If access is uniform, you need a larger GPU pool. Neither case requires serving 1,000 adapters simultaneously — just the active concurrency set.
+
+**Check 3 — What is your KV cache budget?**
+
+Calculate the KV cache requirement for your typical batch:
+
+```python
+kv_per_token = n_layers × n_kv_heads × head_dim × 2 × dtype_bytes
+kv_per_request = kv_per_token × avg_sequence_length
+kv_budget = gpu_vram - model_weights - adapter_pool_size
+max_concurrent_requests ≈ kv_budget / kv_per_request
+```
+
+If your adapter pool reduces `max_concurrent_requests` below your target, either reduce `max_loras_per_batch` or provision a larger GPU.
+
+**Check 4 — Do you need dynamic loading or can you pre-load at startup?**
+
+Pre-loading all adapters at startup (like Layer 20 does, but extended to N adapters via `--lora-paths`) works when your adapter catalog is fixed and fits in CPU DRAM. Dynamic loading (via `/load_lora_adapter` or LoRAResolver) is needed when adapters are created continuously (e.g., user-specific fine-tunes, RL training loops) or when the catalog is too large for full pre-loading.
+
+### The Hardware Decision
+
+| Scenario | Recommendation |
 |---|---|
-| Development and testing | Standard vLLM or SGLang in monolithic mode |
-| Small models (< 13B) | KV cache is small; transfer overhead may exceed interference savings |
-| Batch-only workloads | TTFT doesn't matter; throughput is the only metric; no disaggregation needed |
-| Short prompts + short outputs | Local prefill on decode worker is faster |
-| < 16 total GPUs | Too small for the overhead to pay off |
-| No RDMA (TCP only) | Transfer latency neutralises the benefit for typical prompt sizes |
+| 1 adapter, static | Merge into base model; zero overhead; standard serving |
+| 2–4 adapters, stable | Pre-load at startup with `--lora-paths`; minimal pool |
+| 5–100 adapters, stable catalog | SGLang or vLLM with `max_loras_per_batch=8–16`; LRU eviction |
+| 100+ adapters, dynamic catalog | Dynamic loading via REST API or LoRAResolver; tier to CPU/disk |
+| RL training pipeline | vLLM with in-place reload (`load_inplace=true`) |
+| Serverless / per-request isolation | LoRAX with backbone sharing; ServerlessLoRA-style architecture |
 
----
+### The Economic Case
 
-## 12. The Decision Framework and Cost Arithmetic
+For the typical SaaS scenario that motivated this technology — 1,000 customer-specific fine-tunes of a 7B model:
 
-### The 5-Check Framework
-
-Before refactoring your serving stack, run through these checks:
-
-**Check 1 — Measure your prefill-to-decode time ratio**
-Run your current deployment under production load and record what fraction of wall-clock GPU time is spent in each phase. If decode accounts for less than 70% of request duration, disaggregation has a smaller utilisation payoff. If decode exceeds 85% of wall time, you are paying for idle tensor cores most of the day.
-
-**Check 2 — Calculate your KV cache transfer size**
-Use the formula above. If it exceeds 500 MB per request and your network is under 100 Gbps, the transfer latency will consume your TTFT budget. Run this for your actual model and median prompt length, not a theoretical worst case.
-
-**Check 3 — Check your prefix cache hit rate**
-If your prefix cache hit rate is above 80%, a large fraction of requests can skip the prefill pool entirely and run prefill locally on the decode worker. The value of a separate prefill pool decreases with hit rate.
-
-**Check 4 — Count your GPUs**
-Below ~16 GPUs, scheduling overhead typically exceeds utilisation gain. Above 32 GPUs with sustained traffic, the cost savings from right-sized hardware start to compound.
-
-**Check 5 — Audit your network**
-Do your nodes have RDMA-capable NICs (EFA on AWS, ConnectX on bare metal)? At what bandwidth? If you are limited to TCP, disaggregation can still work for long-context workloads, but effective transfer bandwidth will be lower than the InfiniBand numbers.
-
-**Decision:** If checks 1, 4, and 5 all come back favorable → disaggregation will almost certainly reduce your per-token serving cost.
-
-### Cost Arithmetic
-
-**Choosing GPU types per pool:**
-
-| | Prefill Pool | Decode Pool |
+| Architecture | GPU instances | Monthly cost (H100 at $3/hr) |
 |---|---|---|
-| **Bottleneck** | Compute (tensor cores) | Memory bandwidth (HBM) |
-| **Best GPU** | H100 SXM (high FLOPS) | H200 (larger HBM3e, higher BW) |
-| **Why H200 is overkill for prefill** | Paying for HBM capacity that prefill doesn't use | — |
-| **Why H200 is better for decode** | — | Larger HBM fits more concurrent KV caches; higher BW reduces decode latency |
+| Dedicated per adapter | 1,000 | ~$2.16M/month |
+| Multi-LoRA (single server, 100 concurrent) | 10–20 | ~$22K–$43K/month |
+| Savings | — | **~98% cost reduction** |
 
-A prefill chip with 40% less HBM bandwidth loses only 17% of prefill performance (SPAD paper, UT Austin) — because prefill doesn't use that bandwidth. A decode chip with 50% less compute loses only 22% of decode performance — because decode doesn't use that compute. The silicon savings from removing unused capability are substantial.
+The savings assume 24/7 serving with comparable request rates. Real workloads have uneven traffic; the actual savings come from not provisioning for peak on each adapter independently.
 
-**Cluster-level savings:**
-
-- **InfoQ analysis**: 15–40% total infrastructure cost reduction from disaggregation at cluster scale.
-- This comes from: not overprovisioning hardware, eliminating idle tensor cores during decode, and being able to add decode workers without buying unused prefill capacity.
-
-**The adoption curve:**
-
-Eighteen months separated the DistServe paper (OSDI 2024) from production deployment at Perplexity, Meta, LinkedIn, Mistral, and NVIDIA's own Dynamo framework. That is fast, even by ML infrastructure standards. Systems teams that have already sized for disaggregation and designed their network infrastructure for InfiniBand are paying less per token than teams that haven't.
+> "The transition from 'One Model per GPU' to '1000 Adapters per GPU' is more than just a hardware optimisation; it is a fundamental shift in how we architect AI systems." — Neel Shah (Towards AI), 2026
 
 ---
 
 ## Key Quotes
 
-> "To make sure inference is not compute- and bandwidth-bound at the same time, we want to separate them." — Jackson MZ
+> "Fine-tuning large language models is easier than ever. Serving them efficiently? That's where LoRAX steps in." — Sai Mudhiganti, July 2025
 
-> "Since prefill primarily determines the TTFT and decode impacts ITL, collocating them makes it difficult to optimize both metrics simultaneously." — BentoML
+> "There are two methods to compute h using LoRA... approach 2) seems to be more suitable for a multi-task/tenancy scenario, as we can compute the left term once, the right term for every adapter n, and sum them as needed." — João Moura (AWS), January 2024
 
-> "A Llama 70B model running inference on an H100 GPU hits 92% compute utilization during prefill. Thirty milliseconds later, during decode, that same GPU drops to 30%. The hardware hasn't changed. The model weights are identical." — TDS, April 2026
+> "Punica achieves 12× higher throughput in serving multiple LoRA models compared to state-of-the-art LLM serving systems while only adding 2ms latency per token." — Punica (MLSys 2024)
 
-> "Goodput = number of requests that meet both the TTFT SLO and the TPOT SLO per unit time." — Hao Zhang, CMU LLM Systems
+> "Loading more adapters to GPU for concurrent execution means you will have less DRAM available to store the KV cache... the optimal configuration will be defined by the specific requirements of your workload." — João Moura (AWS), January 2024
 
-> "This technique significantly boosts overall system throughput while meeting SLAs, translating to lower cost per token. Additionally, this technique gives Perplexity the flexibility to use different NVIDIA GPU products for each inference phase." — NVIDIA Spotlight on Perplexity, December 2024
+> "The transition from 'One Model per GPU' to '1000 Adapters per GPU' is more than just a hardware optimisation; it is a fundamental shift in how we architect AI systems." — Neel Shah (Towards AI), March 2026
 
-> "To the best of our knowledge, this is the highest reported throughput for DeepSeek-V3 serving at that time." — SGLang Team, May 2025
-
-> "If your workload is too small, or your GPU setup isn't tuned for this approach, performance can drop by 20–30% in our tests." — BentoML
+> "To the best of our knowledge, this is the highest reported throughput for DeepSeek-V3 serving at that time." (The same architecture SGLang uses for multi-LoRA runs the DeepSeek-V3 96 H100 deployment) — SGLang Team, May 2025
 
 ---
 
 ## What Is Left Out and Why
 
-### Left out: DistServe formal goodput derivation
+### Left out: Punica SGMV kernel CUDA implementation
 
-The DistServe paper (L3/01) formalises goodput with a mathematical model of SLO satisfaction under load, derives optimal placement policies, and introduces the interference quantification framework. This is L3 material — it requires engaging with the queuing model and the formal argmax over goodput. The goodput concept is explained here at L1 level; the formal derivation belongs at L3.
+Section 4 explains what SGMV does and why it is faster than naive per-adapter kernel launches. The Punica paper (L3/02) contains the actual CUDA implementation: thread block assignment to segments, gather operation for non-contiguous adapter pages, handling of variable-rank adapters in the same launch. These implementation details require CUDA programming knowledge and belong at L3.
 
-### Left out: Splitwise hardware simulation
+### Left out: S-LoRA Unified Paging formal analysis
 
-Splitwise (Microsoft Research, ISCA 2024) characterises prefill vs decode hardware requirements from production traces and proposes purpose-built prefill/decode silicon. The simulation results and hardware design proposals are L3 material; the hardware heterogeneity insight (prefill benefits from FLOPS, decode from HBM bandwidth) is included here.
+Section 7 describes how SGLang's `max_loras_per_batch` and `lora_eviction_policy` work conceptually. S-LoRA (L3/03) provides the formal analysis: proof that Unified Paging eliminates fragmentation, the queuing model for adapter loading latency, and the tensor parallelism sharding derivation. These belong at L3.
 
-### Left out: Mooncake RDMA internals
+### Left out: dLoRA merge/unmerge credit algorithm
 
-The Mooncake Transfer Engine paper describes multi-NIC pooling, topology-aware path selection, and GPUDirect RDMA memory registration. These implementation details of the transfer layer are L3 material. The transfer latency numbers (what bandwidth Mooncake achieves) are included; the mechanism producing them is not.
+Section 12's decision framework includes the insight that merging is better for skewed adapter distributions. dLoRA (L4/01) formalises this as a credit-based algorithm with configurable thresholds and adaptive merging based on live traffic. The full algorithm and its convergence analysis belong at L4.
 
-### Left out: SARATHI chunked-prefill pipeline mechanics
+### Left out: CaraServe CPU-assisted prefill
 
-SARATHI's analysis of pipeline bubbles, the chunking policy, and the formal comparison with disaggregation are L4 material. Chunked prefill is introduced here as the "scheduling workaround with limits"; its internal mechanics are not.
+CaraServe (L4/02) addresses cold-start latency by overlapping CPU prefill execution with adapter loading. This is a niche optimisation for systems where adapter cold starts are frequent and CPU prefill is fast enough to be useful. It is not covered here because neither SGLang nor vLLM currently implement it, and it requires understanding the CPU-GPU synchronisation model to implement.
 
-### Left out: TaiChi SLO-regime switching
+### Left out: LoRA variant mathematics (DoRA, rsLoRA, PiSSA, EVA)
 
-TaiChi (arXiv, August 2025) proposes a hybrid system that dynamically switches between aggregation and disaggregation based on which SLO regime the current workload falls in, achieving 77% goodput improvement in some configurations. The SLO-regime analysis and switching policy are L4 material.
+Section 9 mentions that PEFT supports variants like `use_rslora=True` and `use_dora=True`. The mathematical derivations of each variant (rsLoRA's `alpha/sqrt(r)` scaling analysis, DoRA's weight decomposition into magnitude and direction, PiSSA's SVD-based initialisation proof) are covered in L3 sources and require engaging with the original LoRA math at depth.
 
-### Left out: vLLM connector architecture and expert parallelism dispatch patterns
+### Left out: InfiniLoRA disaggregated LoRA server
 
-The vLLM `BaseKVConnector`, `KVLookupBufferBase`, and `--kv-transfer-config` connector types (PyNcclConnector, MooncakeConnector, etc.) are L4 implementation material. Similarly, DeepEP normal vs low-latency dispatch modes, EPLB configuration, and multi-token prediction simulation are L3+ material.
+InfiniLoRA (L4/06) extends PD disaggregation to LoRA computation, running adapter deltas on a dedicated LoRA Server cluster that communicates with base model workers via GPU-initiated RDMA. This is the frontier of multi-LoRA architecture but requires understanding both PD disaggregation (Layer 19) and multi-LoRA serving (Layer 20) before it makes sense. It is L4 material.
+
+### Left out: Loquetier unified fine-tuning and serving
+
+Loquetier (L4/03) addresses the case where the same GPU cluster must simultaneously train new adapters and serve existing ones. The Virtualised Module design and fused training+serving kernel are advanced systems engineering material that belongs at L4 and requires understanding gradient computation in the presence of batched inference.

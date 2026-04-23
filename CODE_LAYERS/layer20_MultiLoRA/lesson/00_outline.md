@@ -1,256 +1,150 @@
-# Layer 18 — Lesson Outline: KV Cache Quantization
+# Layer 20 — Lesson Outline: Single-Adapter LoRA Serving
 
 ## What This Lesson Covers
 
-Layer 12 introduced `RadixCache` and `MHATokenToKVPool`: the KV cache stored in GPU VRAM as BF16 tensors. Layer 17 introduced HiCache: moving those BF16 tensors across tiers when VRAM fills. Layer 18 asks a different question — what if we stored each KV tensor value in **fewer bits** to begin with?
+Layer 19 introduced PD disaggregation: routing prefill and decode to different GPU pools for better resource utilisation. Layer 20 asks a different question — what if different requests need different *model behaviours*? Not different hardware, but different **fine-tuned variants** of the same base model?
 
-KV cache quantization stores the Key and Value tensors in FP8 (1 byte) or FP4 (0.5 byte) instead of BF16 (2 bytes). This halves or quarters the memory footprint of the KV cache directly — fitting more tokens in GPU VRAM, increasing throughput at larger batch sizes, and reducing the PCIe transfer cost when combined with HiCache tiering. The tradeoff is a small accuracy loss from the reduced numerical precision of the stored values.
+LoRA (Low-Rank Adaptation) fine-tunes a model by injecting small rank-decomposed weight matrices (`A` and `B`) into each linear projection. At inference time, the base weights stay frozen; the adapter adds a learned delta:
 
-This layer covers the full stack: why the KV cache dominates VRAM at scale → what float8 represents and why it is harder to use than float8 weight quantization → how SGLang implements FP8 KV (the `BaseKVCacheMethod`, `configure_kv_cache_dtype`, and `set_kv_buffer` paths) → how vLLM extends this with per-token-head dynamic scales, `q_scale`/`prob_scale`, and TurboQuant → what the research literature reveals about sub-FP8 quantization (KIVI, KVQuant, SageAttention2) → and how to choose the right configuration for your workload.
+```
+output = x @ W.T  +  (x @ A.T) @ B.T * scaling
+```
 
-No new model execution logic is introduced. The model forward pass, attention kernels, and scheduler carry forward unchanged. The new work is entirely in how KV tensors are **encoded when written to the cache** and **decoded when read back** for attention — the write path in `set_kv_buffer()` and the read path inside the attention backend.
+At rank=8 with `alpha=32`, one adapter for Qwen3-0.6B adds ~3 MB — trivial compared to the ~1.2 GB base model. The key inference challenge is serving multiple adapters in a **single batched forward pass** where different requests use different adapters.
+
+This layer implements the minimal case: **one static adapter loaded at startup**, where each request independently selects the base model or the adapter. The core mechanism is a per-token float mask that gates the LoRA delta:
+
+```
+output = base_output + delta * lora_mask   (mask = 1.0 or 0.0 per token)
+```
+
+This allows mixed batches — some requests using the adapter, others using the base model — in a single forward pass with no routing complexity. The full multi-LoRA system (pool management, LRU eviction, segmented GEMM kernels) is documented in `sglang_multi_lora_implementation.md` as a reference; this layer focuses on understanding and implementing the correctness-critical path.
 
 ---
 
 ## Sections
 
-### 01 — The Memory Bottleneck: Why KV Cache Quantization Exists (`01_memory_bottleneck.md`)
+### 01 — LoRA Math and Why Rank Decomposition Works (`01_lora_math.md`)
 
-- KV cache size scales with `num_layers × 2 × num_heads × head_dim × num_tokens × bytes_per_element`
-- At BF16 (2 bytes): Llama-3.1-70B serving a 10K-token context in a batch of 32 requires ~26 GB of KV cache — more than the model weights themselves
-- The dual pressure: serving larger **batch sizes** (for throughput) and longer **context lengths** (for capability) both grow the KV cache in opposite directions, making VRAM the binding constraint at both extremes
-- Why this is different from the HiCache problem (Layer 17): HiCache moves KV tensors to cheaper tiers when VRAM fills; quantization shrinks the KV tensors so more fit in VRAM in the first place — they are orthogonal and composable
-- The decode bottleneck: at decode time, the GPU must load all KV layers for every active token in the batch on every step — this is memory-bandwidth-bound, not compute-bound; halving the KV size doubles the effective memory bandwidth available for decode
-- The math: for Llama-3.1-70B with 80 layers, 64 KV heads, head_dim=128, and a batch of 32 requests each 2048 tokens long:
-  - BF16: 80 × 2 × 64 × 128 × 32 × 2048 × 2 bytes ≈ 170 GB
-  - FP8: same × 1 byte ≈ 85 GB — fits on a single 8×H100 node
-  - FP4: same × 0.5 byte ≈ 42 GB — fits on 4×H100
+- LoRA represents the weight delta as `ΔW = B @ A` where `A ∈ ℝ^{r×d}` and `B ∈ ℝ^{d_out×r}` with rank `r ≪ min(d, d_out)`
+- For Qwen3-0.6B with `r=8`: `q_proj` delta is `[8, 1024]` (A) + `[2048, 8]` (B) = 24,576 parameters vs `[2048, 1024]` = 2,097,152 base parameters — **0.6% overhead per projection**
+- Scaling: `lora_alpha / r` (not 1/r) gives a hyperparameter to control delta magnitude without changing rank
+- Why rank works: fine-tuning updates occupy a low-dimensional subspace of the full weight space; LoRA exploits this by directly parameterising that subspace
+- The `phh/Qwen3-0.6B-TLDR-Lora` adapter used in this layer: `r=8`, `lora_alpha=32`, `scaling=4.0`, targets `q_proj` and `v_proj` only
 
-### 02 — Float8 and the Quantization Taxonomy (`02_fp8_and_taxonomy.md`)
+### 02 — The Mask-Based Mixed-Batch Strategy (`02_mask_strategy.md`)
 
-- What float8 is: the two FP8 formats used in deep learning hardware:
-  - `fp8_e4m3`: 4 exponent bits, 3 mantissa bits — range ±448, preferred for activations (more precision, less range)
-  - `fp8_e5m2`: 5 exponent bits, 2 mantissa bits — range ±57344, more range but less precision
-- Why FP8 ≠ INT8: FP8 uses a floating-point encoding with an exponent, so it covers a wider dynamic range than INT8 at the cost of non-uniform quantization steps; this is important because KV activations can have outliers that INT8 would clip
-- The per-tensor vs per-token vs per-channel scale problem: a single scale per attention layer (per-tensor) must accommodate outlier channels, leaving normal channels under-quantized; the KIVI paper's key finding:
-  - **Key (K) cache**: channel-wise outliers (specific feature dimensions are consistently large across all tokens) → needs per-channel scale
-  - **Value (V) cache**: token-wise variation (magnitudes vary by token, not by channel) → needs per-token scale
-  - Production engines (SGLang, vLLM) use per-tensor for simplicity; KIVI achieves much better accuracy at the same or lower bit-width with asymmetric granularity
-- Pre-RoPE vs post-RoPE quantization: rotary positional embedding (RoPE) rotates the K vectors, scrambling the channel-wise structure; quantizing K before RoPE (KVQuant's technique) gives more stable statistics; current production engines cache post-RoPE K — a known limitation
-- The quantization design space:
-  ```
-  By precision:   FP8 (1 byte) > INT8 (1 byte) > FP4 (0.5 byte) > INT4 (0.5 byte) > INT2
-  By granularity: per-tensor < per-channel < per-token-head < per-vector
-  By scale source: calibrated (static) < dynamic (computed at cache-write time)
-  ```
-- Where Layer 18 focuses: FP8 and FP4 production paths in SGLang and vLLM; research directions for sub-FP8
+- **The problem**: a batch of N requests may use different adapters (or no adapter). Launching one forward pass per adapter is linear cost O(N_adapters); we want O(1).
+- **The mask solution**: one scalar `lora_mask[i] ∈ {0.0, 1.0}` per request token. The LoRA delta is computed for every token, then multiplied by the mask before adding to the base output.
+- Shape conventions:
+  - EXTEND (packed prefill): `lora_mask` is `[1, total_tokens, 1]`
+  - DECODE (one token per request): `lora_mask` is `[B, 1, 1]`
+  - The trailing `1` broadcasts over the output dimension
+- Why compute delta for base-model tokens and zero it out: the wasted FLOPs are proportional to `n_base_tokens / n_total_tokens`. For a batch where half use LoRA, we waste 50% of the delta compute. This is the efficiency cost of the minimal implementation — the production segmented GEMM (Punica) eliminates it.
+- Zero overhead when no LoRA requests: `lora_adapter=None` is checked once per layer; the entire delta path is skipped with a single `if` check.
 
-### 03 — SGLang FP8 KV: The Write and Read Path (`03_sglang_fp8_kv.md`)
+### 03 — `lora.py`: Loading the Adapter (`03_lora_adapter.md`)
 
-- `configure_kv_cache_dtype()` (`model_runner.py:2007`): maps `--kv-cache-dtype` string to a torch dtype; handles the `"auto"` path that reads `kv_cache_quant_algo` from the model's `config.json` to detect FP8 quantized checkpoints without an explicit flag
-- `BaseKVCacheMethod` (`layers/quantization/kv_cache.py:16`): attaches `k_scale` and `v_scale` as `nn.Parameter` (initialized to -1.0) to each `RadixAttention` layer; loaded from the `--quantization-param-path` JSON file after model load; falls back to 1.0 with a warning if missing
-- Loading scales from checkpoint (`model_runner.py:1288`): `model.load_kv_cache_scales(path)` reads per-layer scale JSON and populates `layer.k_scale_float` / `layer.v_scale_float`; the FP8-FNUZ path (AMD ROCm) doubles the scales due to the different FP8 encoding
-- `MHATokenToKVPool` pool allocation (`memory_pool.py:662`): FP8 dtypes use `store_dtype = torch.uint8` because PyTorch's `index_put_()` is not implemented for `torch.float8_*`; the buffer holds uint8 bytes that are reinterpreted as FP8 via `.view(dtype)` at attention time
-- **The write path** — `set_kv_buffer()` (`memory_pool.py:995`):
-  ```python
-  # 1. Scale down from BF16 range to FP8 range
-  cache_k.div_(k_scale)
-  cache_v.div_(v_scale)
-  # 2. Cast to FP8 dtype
-  cache_k = cache_k.to(fp8_e4m3fn)
-  cache_v = cache_v.to(fp8_e4m3fn)
-  # 3. Reinterpret as uint8 for index_put
-  cache_k = cache_k.view(torch.uint8)
-  # 4. Scatter into paged KV buffer
-  ```
-- **The read path**: `get_key_buffer()` returns the uint8 tensor; the attention backend calls `.view(fp8_dtype)` to recover the FP8 view; FlashInfer and TRT-LLM accept the FP8 KV directly with a `bmm1_scale` argument — dequantization is fused inside the attention kernel
-- MLA + FP8 KV path (`memory_pool.py:1467`): `MLATokenToKVPool` with FP8 expands the KV cache dimension to include per-tile FP32 scale storage alongside the FP8 data; `nsa_kv_cache_store_fp8` handles the fused quant + packed write; dequantization uses `dequantize_k_cache_paged()` in `nsa_backend.py`
-- Key code anchors:
+- `LoRAAdapter` reads `adapter_config.json` to get `r`, `lora_alpha`, `target_modules`
+- Streams A and B tensors from `adapter_model.safetensors` (or `.bin`)
+- Parses HuggingFace PEFT key format: `base_model.model.model.layers.{i}.self_attn.q_proj.lora_A.weight`
+- Stores in nested dicts: `A_weights[layer_idx][module_name]`, `B_weights[layer_idx][module_name]`
+- `apply(x, layer_idx, module_name)` returns `(x @ A.T) @ B.T * scaling` or `None` if that layer/module is not targeted — callers check `None` before adding
+- Supports both `.safetensors` and `.bin` checkpoints; resolves HF Hub IDs via `snapshot_download`
 
-| Concept | Location |
-|---|---|
-| `--kv-cache-dtype` CLI flag | `REPOS/sglang/python/sglang/srt/server_args.py:4169` |
-| `--quantization-param-path` flag | `REPOS/sglang/python/sglang/srt/server_args.py:4159` |
-| `configure_kv_cache_dtype()` | `REPOS/sglang/python/sglang/srt/model_executor/model_runner.py:2007` |
-| Load KV scales from checkpoint | `REPOS/sglang/python/sglang/srt/model_executor/model_runner.py:1288` |
-| `BaseKVCacheMethod` | `REPOS/sglang/python/sglang/srt/layers/quantization/kv_cache.py:16` |
-| FP8 stored as uint8 | `REPOS/sglang/python/sglang/srt/mem_cache/memory_pool.py:662` |
-| `set_kv_buffer()` write path | `REPOS/sglang/python/sglang/srt/mem_cache/memory_pool.py:995` |
-| TRT-LLM fused FP8 write | `REPOS/sglang/python/sglang/srt/layers/attention/trtllm_mha_backend.py:552` |
-| Triton FP8 KV kernel | `REPOS/sglang/python/sglang/srt/layers/attention/triton_ops/trtllm_fp8_kv_kernel.py` |
-| `ModelOptFp8KVCacheMethod` | `REPOS/sglang/python/sglang/srt/layers/quantization/modelopt_quant.py:277` |
+### 04 — Wiring LoRA into the Forward Pass (`04_wiring.md`)
 
-### 04 — vLLM's Extended Quantization Model (`04_vllm_kv_quant.md`)
+Five files are changed to thread `lora_mask` and `lora_adapter` through the model stack:
 
-- `CacheDType` literal type (`vllm/config/cache.py:18`): 13 supported KV formats vs SGLang's 5; adds `fp8_per_token_head`, `int8_per_token_head`, `nvfp4`, `turboquant_*`, `fp8_ds_mla`
-- `KVQuantMode` enum (`vllm/v1/kv_cache_interface.py:30`): centralized dispatch (`NONE`, `FP8_PER_TENSOR`, `INT8_PER_TOKEN_HEAD`, `FP8_PER_TOKEN_HEAD`, `NVFP4`) replacing string comparison throughout the codebase
-- **Per-token-head dynamic quantization** (`fp8_per_token_head`, `int8_per_token_head`): scales are computed dynamically **per (token, head)** at cache-write time in the fused CUDA kernel — no calibration dataset or `--quantization-param-path` required; `page_size_bytes` adds `2 × block_size × num_kv_heads × 4 bytes` for the float32 scale tensors; per-token-head is more principled than per-tensor because it adapts to each token's actual activation range
-- **Extended scales: `q_scale` and `prob_scale`** (`vllm/model_executor/layers/quantization/kv_cache.py:40`): beyond K and V storage, vLLM attaches scales for the Q-projection output and the softmax probability matrix — enabling fully end-to-end FP8 attention where `Q×K^T` and `P×V` matmuls run in FP8 compute; SGLang does not have these compute-path scales
-- **Fused CUDA kernel** `reshape_and_cache_flash` (`csrc/cache_kernels.cu:704`): scale application + cast to FP8 + scatter into paged layout in a single kernel; `k_scale` may be shape `[1]` (per-tensor) or `[num_heads]` (per-head) with `kv_scale_stride` dispatch; NVFP4 dispatches to a separate SM100-compiled kernel
-- **TurboQuant** (vLLM-only): NVIDIA Research's custom mixed-precision format storing K in INT8 and V in INT4 (`turboquant_k8v4`) or both in 3-bit (`turboquant_3bit_nc`); first 2 and last 2 attention layers are automatically skipped (different activation statistics at boundaries); not yet in SGLang
-- **Sleep-mode scale bug** (`vllm/v1/worker/gpu_model_runner.py:885`): `init_fp8_kv_scales()` resets all per-layer scales to 1.0 after a GPU wakes from idle sleep — calibrated scales from the checkpoint are lost; a known TODO in the codebase; a production-correctness risk for deployments using llm-compressor calibrated checkpoints
+1. **`forward_batch.py`** — two new optional fields: `lora_mask` and `lora_adapter`
+2. **`model/qwen3.py`** — `Qwen3Model.forward()` and `Qwen3ForCausalLM.forward()` accept `lora_mask`/`lora_adapter` kwargs; all three `ForwardBatch` construction sites populate them
+3. **`model/attention.py`** — after `q_proj`/`k_proj`/`v_proj` projections and after `o_proj`, adds `delta * mask` when adapter is active
+4. **`model/mlp.py`** — accepts `forward_batch` argument; adds `delta * mask` for `gate_proj`, `up_proj`, `down_proj`; stores `layer_idx` for `apply()` lookups
+5. **`model/decoder_layer.py`** — passes `layer_idx` to `Qwen3MLP.__init__`; passes `forward_batch` to `self.mlp()`
 
-Key code anchors:
+The LoRA delta is added **after** the base linear projection and **before** any downstream operation (e.g., before the `view()` reshape in attention, before `F.silu()` in MLP). This matches PEFT's implementation exactly.
 
-| Concept | Location |
-|---|---|
-| `CacheDType` — all 13 formats | `REPOS/vllm/vllm/config/cache.py:18` |
-| `KVQuantMode` enum | `REPOS/vllm/vllm/v1/kv_cache_interface.py:30` |
-| `page_size_bytes` with scale storage | `REPOS/vllm/vllm/v1/kv_cache_interface.py:132` |
-| `BaseKVCacheMethod` (q/k/v/prob scales) | `REPOS/vllm/vllm/model_executor/layers/quantization/kv_cache.py:18` |
-| Per-token-head scale deletion | `REPOS/vllm/vllm/model_executor/layers/quantization/kv_cache.py:57` |
-| `reshape_and_cache_flash` CUDA kernel | `REPOS/vllm/csrc/cache_kernels.cu:704` |
-| NVFP4 dispatch (SM100 only) | `REPOS/vllm/csrc/cache_kernels.cu:731` |
-| FP8 read path + descale tensors | `REPOS/vllm/vllm/v1/attention/backends/flash_attn.py:743` |
-| Sleep-mode scale reset | `REPOS/vllm/vllm/v1/worker/gpu_model_runner.py:885` |
+### 05 — Server and Config Integration (`05_server_config.md`)
 
-### 05 — Research Frontiers: Sub-FP8 and Compute Quantization (`05_research_frontiers.md`)
+- `config.yml`: single `lora_path` field (replaces the multi-adapter pool config); `null` disables LoRA entirely
+- `server.py`: `ChatRequest` gains `lora_id: Optional[str]`; any non-null string activates the adapter for that request; `Req.lora_id` carries this flag through the scheduler
+- `model_runner.py`: `__init__` accepts `lora_path`; loads `LoRAAdapter` at startup and stores on `self.lora_adapter`; `prefill_batch` and `decode_step` each build `lora_mask` from `req.lora_id` before the `model.forward()` call
 
-- **KIVI — 2-bit Asymmetric KV Cache Quantization** (NeurIPS 2024, arXiv 2402.02750):
-  - Core finding: K has channel-wise outliers (same channels are large across all tokens) → quantize K **per-channel**; V has token-wise variation → quantize V **per-token**
-  - Algorithm: quantize all but the last `group_size` tokens (residual FP16); merge into INT2 once the residual window advances
-  - Result: 2.6× peak memory reduction (including weights), 2.35–3.47× throughput, near-identical quality on LLaMA, Falcon, Mistral
-  - Why it matters: demonstrates that per-tensor FP8 (current production approach) is leaving significant accuracy on the table — per-channel K quantization is fundamentally better
+Example API usage:
+```bash
+# Base model (no LoRA)
+curl -X POST http://localhost:8114/v1/chat/completions \
+  -d '{"messages": [{"role": "user", "content": "What is 2+2?"}]}'
 
-- **KVQuant — Sub-4-bit with Pre-RoPE Quantization** (NeurIPS 2024, arXiv 2401.18079):
-  - Pre-RoPE K quantization: quantize K **before** the rotary positional embedding is applied; RoPE scrambles the channel structure of K making post-RoPE quantization harder; pre-RoPE K has more stable per-channel statistics
-  - Non-uniform per-layer datatypes: fit the quantization grid to the actual (non-Gaussian) KV distribution
-  - Per-vector dense-and-sparse: isolate extreme outliers in a sparse FP16 component, quantize the remainder tightly
-  - Result: < 0.1 perplexity degradation at 3-bit; 1 million token context on a single A100-80GB
-  - Implementation gap: both SGLang and vLLM currently cache **post-RoPE K**; implementing pre-RoPE quantization requires splitting the `apply_rotary_pos_emb()` call and the KV cache write — a non-trivial architectural change
+# LoRA adapter
+curl -X POST http://localhost:8114/v1/chat/completions \
+  -d '{"messages": [...], "lora_id": "tldr"}'
+```
 
-- **SageAttention2 — INT4/FP8 Attention Compute** (ICML 2025, arXiv 2411.10958):
-  - Quantizes the **attention matmul** itself, not just storage: Q and K cast to INT4 (per-thread granularity), P̃ and V to FP8
-  - Q outlier smoothing: per-channel scale applied before INT4 cast (same insight as KIVI's per-channel K)
-  - Two-level FP8 accumulation: partial sums in FP8, final reduce in FP32
-  - Result: ~3× faster than FlashAttention2 on RTX 4090; matches FlashAttention3 FP8 on Hopper GPUs with better accuracy
-  - Composability: FP8 KV storage (this layer) + SageAttention2 compute = fully quantized attention path; vLLM's `q_scale`/`prob_scale` is the production analog
+### 06 — Verification: `verify_lora.py` (`06_verification.md`)
 
-- **ZipCache — Mixed-Precision with Salient Token Identification** (ECCV 2024, arXiv 2405.14256):
-  - Identifies "salient" tokens (high normalized attention score) → keep at FP16; quantize the rest aggressively
-  - Channel-separable tokenwise quantization reduces scale overhead vs groupwise
-  - FlashAttention-compatible saliency metric (decoupled from full attention scores)
-  - Result: 4.98× compression with only 0.38% accuracy drop on Mistral-7B/GSM8K; 56.9% decode latency reduction
+Four correctness tests, ordered from prerequisite to full coverage:
 
-- **NVFP4** (vLLM, Blackwell hardware):
-  - Packed 4-bit data + FP8 block scales per head; 0.5 bytes per KV value
-  - SM100/SM120 (Blackwell B100/B200) only — compiled separately from the main build
-  - Currently WIP in vLLM (NotImplementedError in FlashInfer builder path)
+| Test | What it checks | Requires |
+|---|---|---|
+| **Test 0** Base model match | Our custom model vs HuggingFace `AutoModelForCausalLM` (NOCACHE path) | torch + transformers |
+| **Test 1** Adapter changes output | LoRA delta ≠ 0 — adapter is actually applied | torch + our lora.py |
+| **Test 2** Matches PEFT | Our LoRA delta matches `PeftModel` delta (external ground truth) | torch + peft |
+| **Test 3** Mixed-batch separation | In a `[lora, base]` batch, each token gets the correct output | CUDA + flashinfer |
+| **Test 4** Paged LoRA | EXTEND+DECODE with LoRA mask matches NOCACHE reference | CUDA + flashinfer |
 
-### 06 — Accuracy, Configuration, and Practical Tradeoffs (`06_accuracy_and_config.md`)
+**Test 2 uses the delta comparison** `(our_lora - our_base) vs (peft_lora - hf_base)` to isolate LoRA math correctness from base model numerical differences. This is more meaningful than comparing absolute logits.
 
-- **Accuracy characterization**:
-  - FP8 with calibrated scales (`--quantization-param-path`): < 0.5% degradation on MMLU, LongBench, HumanEval for calibrated Llama, Qwen, Mistral models
-  - FP8 with scale=1.0 (no calibration): potentially visible degradation for tokens near the FP8 saturation limit; safe for models where the dynamic range happens to fit in FP8 (rare); always warn when missing
-  - FP4 (`fp4_e2m1`, experimental): explicit accuracy drop warning in SGLang source; not recommended for production
-  - Per-token-head dynamic FP8 (vLLM): comparable to calibrated per-tensor without the calibration overhead; better for diverse input distributions (multi-language, code+text)
-
-- **Scale calibration workflow** (for `--quantization-param-path`):
-  ```python
-  # Using llm-compressor (neural-magic/llm-compressor) to generate scales
-  from llmcompressor.modifiers.quantization import QuantizationModifier
-  recipe = QuantizationModifier(
-      targets="Linear",
-      scheme="FP8",
-      ignore=["lm_head"],
-      kv_cache_scheme={"type": "float8", "strategy": "tensor"}
-  )
-  # Outputs: quantization_config.json with per-layer k_scale / v_scale
-  ```
-  - Many HuggingFace checkpoints include scales: `meta-llama/Meta-Llama-3.1-8B-Instruct-FP8`, `Qwen/Qwen2.5-72B-Instruct-GPTQ-Int4-FP8KV`, etc.
-  - With `--kv-cache-dtype auto` + an FP8 checkpoint, SGLang reads `kv_cache_quant_algo` from `config.json` and loads scales automatically
-
-- **SGLang launch commands**:
-  ```bash
-  # FP8 KV with auto-detected scales from checkpoint
-  python -m sglang.launch_server \
-    --model meta-llama/Meta-Llama-3.1-70B-Instruct-FP8 \
-    --kv-cache-dtype auto \
-    --tp 8
-
-  # FP8 KV with explicit calibrated scales
-  python -m sglang.launch_server \
-    --model meta-llama/Meta-Llama-3.1-70B-Instruct \
-    --kv-cache-dtype fp8_e4m3 \
-    --quantization-param-path /path/to/kv_cache_scales.json \
-    --tp 8
-
-  # FP8 KV without calibration (convenient, slight accuracy risk)
-  python -m sglang.launch_server \
-    --model meta-llama/Meta-Llama-3.1-70B-Instruct \
-    --kv-cache-dtype fp8_e4m3 \
-    --tp 8
-  ```
-
-- **SGLang KV cache quantization flags**:
-
-  | Flag | Default | Effect |
-  |---|---|---|
-  | `--kv-cache-dtype` | `"auto"` | Storage dtype: `auto`, `fp8_e4m3`, `fp8_e5m2`, `bf16`, `fp4_e2m1` |
-  | `--quantization-param-path` | `None` | Path to JSON with per-layer `k_scale`/`v_scale` values |
-
-- **Workload decision guide**:
-
-  | Workload | Recommended KV dtype | Reasoning |
-  |---|---|---|
-  | Long-context RAG | `fp8_e4m3` with calibrated scales | All tokens preserved; 2× more KV fits in VRAM |
-  | Multi-turn chat | `fp8_e4m3` with calibrated scales | Preserves all turns; 2× throughput |
-  | Coding agent (variable input) | vLLM `fp8_per_token_head` | Code inputs have different distributions; dynamic scales adapt |
-  | Sensitive production | `auto` (BF16) | No accuracy risk; use HiCache (Layer 17) for capacity instead |
-  | Long contexts, tight VRAM | `fp8_e4m3` + HiCache | Composable: 2× compression + multi-tier capacity |
-
-- **Interaction with weight quantization**: FP8 KV and weight quantization (GPTQ, AWQ, FP8 weights) are independent and composable:
-  - BF16 weights + FP8 KV: safest — full weight precision, halved KV memory
-  - FP8 weights + FP8 KV: maximum compression; recommended when throughput is the goal and calibrated checkpoints exist
-  - GPTQ INT4 weights + FP8 KV: deepest compression; research-grade accuracy monitoring recommended
-
-- **Interaction with HiCache (Layer 17)**: FP8 KV quantization reduces the bytes-per-token transferred over PCIe during HiCache L2 loads — the κ_crit threshold (from the PCIe bottleneck analysis) effectively doubles; for the same PCIe bandwidth, twice as many tokens can be offloaded before the system becomes memory-bandwidth-bound
-
-- **What Layer 18 explicitly defers**:
-  - Mooncake `TransferEngine` for PD disaggregation KV transfer (separate from KV storage format)
-  - MoE-specific quantization (different attention shapes, not covered here)
-  - Training-aware KV quantization (QAT for KV cache) — all methods here are PTQ
-  - Hardware-specific FP4 deployment (Blackwell NVFP4, Grace-Hopper CXL memory)
+**Verified on MPS (Mac, base conda env)**:
+- Test 0: PASS (max_diff ≤ 0.69 with atol=1.0)
+- Test 1: PASS (LoRA delta = 3.375 — clearly non-zero)
+- Test 2: PASS (delta diff ≤ 0.83, confirmed by weight comparison: A max_diff=0.00012, B max_diff=0.0000019 — pure BF16 rounding)
+- Tests 3–4: SKIPPED (no flashinfer on MPS), will run on CUDA
 
 ---
 
 ## Supporting Files
 
-- `summary.md` — narrative walkthrough of all six sections with worked examples, diagrams, and configuration recipes
-- `01_memory_bottleneck.md` — KV cache size math, decode bandwidth bottleneck, how quantization helps
-- `02_fp8_and_taxonomy.md` — float8 encoding, FP8 vs INT8 vs FP4, scale granularity taxonomy
-- `03_sglang_fp8_kv.md` — complete SGLang write and read path with code anchors
-- `04_vllm_kv_quant.md` — vLLM's extended model: KVQuantMode, per-token-head, q_scale/prob_scale, TurboQuant
-- `05_research_frontiers.md` — KIVI, KVQuant, SageAttention2, ZipCache with detailed mechanism explanations
-- `06_accuracy_and_config.md` — calibration workflow, launch commands, workload decision guide, interaction with HiCache
+- `summary.md` — narrative walkthrough of all six sections with worked examples and test results
+- `01_lora_math.md` — LoRA rank decomposition, scaling, FLOP numbers, weight merging vs. residual add
+- `02_mask_strategy.md` — float mask shape conventions, how it is built in model_runner, efficiency analysis
+- `03_lora_adapter.md` — PEFT checkpoint format, `_load_weights()` key parsing, `apply()` GEMM shapes
+- `04_wiring.md` — all five changed files with exact code and ordering rationale
+- `05_server_config.md` — config.yml, ChatRequest schema, startup sequence, API examples
+- `06_verification.md` — all four tests, ground-truth comparison strategy, results, troubleshooting table
+- `sglang_multi_lora_implementation.md` — full reference for production multi-LoRA: pool management, segmented GEMM kernels, LRU eviction, CUDA graph support, dynamic load/unload
+
+## New Implementation Files
+
+| File | Role |
+|---|---|
+| `lora.py` | `LoRAAdapter`: weight loading, `apply()` method |
+| `forward_batch.py` | +`lora_mask`, `lora_adapter` fields |
+| `model/attention.py` | +LoRA deltas for q/k/v/o projections |
+| `model/mlp.py` | +LoRA deltas for gate/up/down; +`layer_idx`, `forward_batch` arg |
+| `model/decoder_layer.py` | +`layer_idx` to MLP init; +`forward_batch` to `mlp()` call |
+| `model/qwen3.py` | +`lora_mask`/`lora_adapter` kwargs in both forward() methods |
+| `model_runner.py` | +`lora_path` arg; `LoRAAdapter` loaded at startup; mask built per batch |
+| `server.py` | +`lora_id` in `ChatRequest`; passed to `Req` |
+| `config.yml` | Simplified to `lora_path: "phh/Qwen3-0.6B-TLDR-Lora"` |
+| `verify_lora.py` | 4-test correctness suite with PEFT ground-truth comparison |
 
 ---
 
-## Key Code Anchors
+## Key Code Anchors (this layer)
 
-| Concept | Location |
-|---|---|
-| `--kv-cache-dtype` choices | `REPOS/sglang/python/sglang/srt/server_args.py:4169` |
-| `--quantization-param-path` warning | `REPOS/sglang/python/sglang/srt/server_args.py:4159` |
-| `configure_kv_cache_dtype()` | `REPOS/sglang/python/sglang/srt/model_executor/model_runner.py:2007` |
-| Auto-detect FP8 from `config.json` | `REPOS/sglang/python/sglang/srt/model_executor/model_runner.py:2008` |
-| Load KV scales from JSON | `REPOS/sglang/python/sglang/srt/model_executor/model_runner.py:1288` |
-| Scale=1.0 warning | `REPOS/sglang/python/sglang/srt/model_executor/model_runner.py:1305` |
-| `BaseKVCacheMethod.create_weights()` | `REPOS/sglang/python/sglang/srt/layers/quantization/kv_cache.py:30` |
-| `process_weights_after_loading()` | `REPOS/sglang/python/sglang/srt/layers/quantization/kv_cache.py:47` |
-| FP8 stored as uint8 (index_put workaround) | `REPOS/sglang/python/sglang/srt/mem_cache/memory_pool.py:662` |
-| `set_kv_buffer()` — full write path | `REPOS/sglang/python/sglang/srt/mem_cache/memory_pool.py:995` |
-| `MHATokenToKVPool` FP8 buffer | `REPOS/sglang/python/sglang/srt/mem_cache/memory_pool.py:640` |
-| `MLATokenToKVPool` FP8 NSA quant | `REPOS/sglang/python/sglang/srt/mem_cache/memory_pool.py:1467` |
-| TRT-LLM fused FP8 set buffer | `REPOS/sglang/python/sglang/srt/layers/attention/trtllm_mha_backend.py:552` |
-| Triton FP8 KV paged write kernel | `REPOS/sglang/python/sglang/srt/layers/attention/triton_ops/trtllm_fp8_kv_kernel.py:1` |
-| NSA dequant for FP8 K | `REPOS/sglang/python/sglang/srt/layers/attention/nsa/dequant_k_cache.py:76` |
-| FlashInfer tensor-core FP8 path | `REPOS/sglang/python/sglang/srt/layers/attention/flashinfer_backend.py:1680` |
-| vLLM `CacheDType` (13 formats) | `REPOS/vllm/vllm/config/cache.py:18` |
-| vLLM `KVQuantMode` enum | `REPOS/vllm/vllm/v1/kv_cache_interface.py:30` |
-| vLLM per-token-head scale storage | `REPOS/vllm/vllm/v1/kv_cache_interface.py:132` |
-| vLLM `BaseKVCacheMethod` (q/k/v/prob) | `REPOS/vllm/vllm/model_executor/layers/quantization/kv_cache.py:18` |
-| vLLM `reshape_and_cache_flash` | `REPOS/vllm/csrc/cache_kernels.cu:704` |
-| vLLM NVFP4 dispatch (SM100) | `REPOS/vllm/csrc/cache_kernels.cu:731` |
-| vLLM FP8 read + descale tensors | `REPOS/vllm/vllm/v1/attention/backends/flash_attn.py:743` |
-| vLLM sleep-mode scale reset | `REPOS/vllm/vllm/v1/worker/gpu_model_runner.py:885` |
+| Concept | File | Symbol / Line |
+|---|---|---|
+| LoRA math: `apply()` | `lora.py` | `LoRAAdapter.apply()` |
+| Weight loading from PEFT format | `lora.py` | `LoRAAdapter._load_weights()` |
+| `lora_mask` + `lora_adapter` on ForwardBatch | `forward_batch.py` | `ForwardBatch` dataclass |
+| QKV LoRA deltas | `model/attention.py` | `Qwen3Attention.forward()` — step 1b |
+| O-proj LoRA delta | `model/attention.py` | `Qwen3Attention.forward()` — step 5b |
+| MLP LoRA deltas | `model/mlp.py` | `Qwen3MLP.forward()` |
+| ForwardBatch populated with LoRA state | `model/qwen3.py` | `Qwen3Model.forward()` |
+| Adapter loaded at startup | `model_runner.py` | `ModelRunner.__init__()` |
+| `lora_mask` built for prefill | `model_runner.py` | `ModelRunner.prefill_batch()` — Step 7 |
+| `lora_mask` built for decode | `model_runner.py` | `ModelRunner.decode_step()` |
+| `lora_id` in API request | `server.py` | `ChatRequest.lora_id` |
+| PEFT ground-truth comparison | `verify_lora.py` | `test_lora_matches_peft()` |
+| Mixed-batch separation test | `verify_lora.py` | `test_mixed_batch_separation()` |

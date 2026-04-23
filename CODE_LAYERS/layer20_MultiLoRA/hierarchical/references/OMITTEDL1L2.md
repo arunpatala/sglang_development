@@ -1,649 +1,1133 @@
-# PD Disaggregation — Material Omitted from COMBINEDL1L2.md
+# Multi-LoRA Inference — Material Omitted from COMBINEDL1L2.md
 
-**What this file is:** The full text of every section omitted from `COMBINEDL1L2.md`. The "What Is Left Out and Why" appendix of `COMBINEDL1L2.md` names each omission and explains why it was excluded. This file preserves the complete original text so no source material is lost.
+**What this file is:** The full text of every section omitted from `COMBINEDL1L2.md`. The "What Is Left Out and Why" appendix of `COMBINEDL1L2.md` names each omission and explains why it was excluded. This file preserves the complete source material so nothing is lost.
 
 **Parent file:** `COMBINEDL1L2.md` (L1 + L2 synthesis)
-**Sources:** L3/01, L3/02, L3/03, L3/04, L4/01, L4/02, L4/03, L2/02 (MoE internals)
+**Sources:** L2/03 (variant math), L3/02 (Punica CUDA), L3/03 (S-LoRA paging), L4/01 (dLoRA), L4/02 (CaraServe), L4/03 (Loquetier), L4/04 (ServerlessLoRA), L4/05 (Predictive-LoRA), L4/06 (InfiniLoRA)
 
 ---
 
-## Omission 1: DistServe — Formal Goodput Model and Interference Quantification
+## Omission 1: Punica — SGMV Kernel CUDA Implementation
 
-**Source:** `L3/01_distserve_osdi24.md`
-**Venue:** USENIX OSDI 2024
-**Why omitted from COMBINEDL1L2.md:** COMBINEDL1L2.md introduces goodput as a concept and cites the 4–7× improvement number. The formal model — how goodput is derived as a function of TTFT/TPOT SLO constraints, how interference is quantified with queuing theory, and how resource allocation is optimised per-phase — requires engaging with the paper's formal framework. The concept belongs at L1; the derivation belongs at L3.
-
----
-
-### The Core Problem: Why Throughput Is the Wrong Metric
-
-Traditional LLM serving optimises for **throughput** — tokens per second or requests per second. But LLM applications care about two distinct latency dimensions:
-
-- **TTFT** (Time to First Token): latency from request submission to the first output token. Dominated by the prefill phase. Users perceive this as "how long before the model starts responding."
-- **TPOT** (Time Per Output Token): latency between consecutive output tokens during decode. Users perceive this as "how fast the model is typing."
-
-**Goodput** is the number of requests completed per second that satisfy **both** TTFT and TPOT SLO constraints simultaneously. A system can have high throughput while having poor goodput if many requests violate one of the SLOs.
-
-### The Colocation Coupling Problem
-
-When prefill and decode share the same GPUs:
-
-1. **Prefill-decode interference**: a large prefill computation wave (processing a 10K-token prompt) runs for hundreds of milliseconds on the GPU. Any decode step scheduled during this window is delayed by the full prefill duration. This spikes TPOT for all currently-decoding requests.
-
-2. **Resource coupling**: the same GPU must handle both compute-bound prefill (needs high FLOP throughput) and memory-bandwidth-bound decode (needs high HBM bandwidth). The parallelism strategy (TP, PP) that optimises prefill degrades decode, and vice versa. There is no single configuration that is optimal for both.
-
-3. **Over-provisioning trap**: to meet both TTFT and TPOT SLOs simultaneously with a collocated system, you must over-provision GPUs — paying for hardware that runs at low utilisation.
-
-### DistServe's Solution: Key Design Choices
-
-**Independent resource allocation**: each phase is provisioned separately based on its own SLO requirements:
-- TTFT SLO tight → scale prefill pool (more GPUs per instance, or more instances).
-- TPOT SLO tight → scale decode pool.
-- Both tight → scale both independently.
-
-**Per-phase parallelism**: the prefill pool can use tensor parallelism optimised for compute throughput (TP-4, high FLOP utilisation). The decode pool can use a configuration optimised for memory bandwidth (TP-8, maximise HBM reads per step). These can be different.
-
-**Bandwidth-aware placement**: DistServe places the two phases according to the serving cluster's bandwidth. If prefill and decode are on the same physical rack (high NVLink/InfiniBand bandwidth), the KV transfer cost is amortised. If on different pods, DistServe reduces transfer cost by adjusting the parallelism to minimise KV cache size.
-
-### Experimental Results
-
-Evaluated on OPT-13B, OPT-66B, OPT-175B across three application workloads (chatbot, document summarisation, coding). Compared against vLLM-continuous-batching (state-of-the-art collocated baseline):
-
-| Metric | DistServe vs vLLM |
-|---|---|
-| Max requests served at SLO (goodput) | **7.4× more requests** |
-| Tightest SLO achievable at same rate | **12.6× tighter** |
-| Requests within SLO (>90% guarantee) | Maintained across all workloads |
-
-**Why 7.4×?** The prefill pool handles 100% compute-bound workloads with optimal TP configuration; the decode pool handles 100% memory-bandwidth-bound workloads with optimal configuration. Neither is compromised by the other's requirements.
-
-### Concept-to-SGLang Mapping
-
-| DistServe Concept | SGLang Equivalent |
-|---|---|
-| Prefill instance (KV producer) | `--disaggregation-mode prefill` server |
-| Decode instance (KV consumer) | `--disaggregation-mode decode` server |
-| KV cache transfer | Mooncake RDMA or NIXL |
-| Router / orchestration layer | `sglang_router.launch_router --pd-disaggregation` |
-| Per-phase resource allocation | Separate `--tp-size`, `--dp-size` per mode |
-| Bandwidth-aware placement | `--disaggregation-ib-device` NIC selection |
-
-**BibTeX:**
-```bibtex
-@inproceedings{zhong2024distserve,
-  title  = {DistServe: Disaggregating Prefill and Decoding for
-             Goodput-optimized Large Language Model Serving},
-  author = {Yinmin Zhong and Shengyu Liu and Junda Chen and Jianbo Hu
-            and Yibo Zhu and Xuanzhe Liu and Xin Jin and Hao Zhang},
-  booktitle = {18th USENIX Symposium on Operating Systems Design and
-               Implementation (OSDI 24)},
-  year   = {2024},
-  url    = {https://arxiv.org/abs/2401.09670}
-}
-```
+**Source:** `L3/02_punica_mlsys24.md`
+**Venue:** MLSys 2024
+**Why omitted from COMBINEDL1L2.md:** COMBINEDL1L2.md explains what SGMV does and why it achieves 12× throughput. The actual CUDA implementation — thread block assignment to segments, gather scatter indices, handling variable-rank adapters in the same launch, the PTX-level memory access pattern — requires CUDA programming knowledge to engage with. The concept belongs at L1/L2; the implementation belongs at L3.
 
 ---
 
-## Omission 2: Splitwise — Production Trace Characterisation and Hardware Heterogeneity
+### What the SGMV Kernel Actually Does
 
-**Source:** `L3/02_splitwise_isca24.md`
-**Venue:** ISCA 2024 (Best Paper Award)
-**Why omitted from COMBINEDL1L2.md:** The hardware heterogeneity insight (prefill benefits from FLOPS, decode benefits from HBM bandwidth) is carried in COMBINEDL1L2.md's cost arithmetic section. The production trace analysis from Azure, the SplitwiseSim simulator, and the vLLM prototype PR are all L3 material — they validate the disaggregation hypothesis empirically and provide the cost/throughput tradeoff data that motivated real deployments.
-
----
-
-### Production Workload Characterisation (Azure Traces)
-
-Splitwise's most important contribution is its use of **real Azure production traces** from two LLM serving services. Key quantified findings:
-
-| Characteristic | Prefill | Decode |
-|---|---|---|
-| Compute profile | Compute-intensive, saturates GPU FLOP throughput | Memory-bandwidth-bound, loads weights + KV per step |
-| GPU utilisation | High (matrix multiplications, full batch parallelism) | Low (autoregressive, one token per step) |
-| Memory pressure | Low (transient activations only) | High (KV cache grows with sequence length) |
-| Power draw | High (compute-bound) | Lower (memory-bandwidth-bound) |
-| Duration | Short (milliseconds to seconds) | Long (seconds to minutes) |
-
-**Key insight quantified from production**: token generation phases **do not require the compute capability of the latest GPUs** and can be run on lower-power, lower-cost hardware with equivalent quality. Even with continuous batching, decode-phase GPU arithmetic intensity is too low to saturate high-FLOP GPUs.
-
-### Hardware Heterogeneity: The Novel Dimension
-
-Splitwise proposes running prefill and decode on **different hardware tailored to each phase**:
-
-| Phase | Optimal hardware | Reason |
-|---|---|---|
-| Prefill (prompt computation) | Latest GPUs (H100, B200) | Highest FLOP throughput per dollar |
-| Decode (token generation) | Older or memory-optimised GPUs (A100, H20) | High HBM bandwidth per dollar; FLOP budget is not the constraint |
-
-**Measured result**: by using H100 for prefill + A100 for decode vs all-H100:
-- **1.4× higher throughput at 20% lower cost**
-- OR **2.35× more throughput at the same cost and power budget**
-
-This hardware heterogeneity insight influenced real cloud deployments — some providers run prefill on latest-gen GPUs while decode runs on previous-generation hardware, reducing serving cost without quality loss.
-
-### The KV State Transfer
-
-Splitwise analyses the KV state transfer using fast back-plane interconnects:
-- Within a rack: NVLink or PCIe direct transfers (high bandwidth, low latency)
-- Across racks: InfiniBand (lower bandwidth, higher latency)
-
-**Amortisation threshold from the paper**: for prompts longer than ~500 tokens generating more than ~50 output tokens, disaggregation is always net-positive in latency.
-
-### SplitwiseSim: Cluster-Level Simulation
-
-SplitwiseSim (https://github.com/Mutinifni/splitwise-sim) is a discrete-event simulator for evaluating cluster-level PD disaggregation policies:
-- Models heterogeneous hardware pools, variable prompt/output length distributions (including the two Azure traces), routing policies, and KV transfer latency as a function of payload size and network topology.
-- Used in research to prototype new routing strategies without a physical cluster.
-- Useful for capacity planning: determine optimal prefill/decode GPU count ratio for a given workload distribution.
-
-### The vLLM Prototype
-
-Splitwise includes a prototype implementation of its KV-cache transfer mechanism in vLLM (**GitHub PR #2809** — the first public implementation of inter-instance KV transfer). This PR became the direct ancestor of vLLM's `vllm/distributed/kv_transfer/` module that all vLLM disaggregation connectors build on today.
-
-**BibTeX:**
-```bibtex
-@inproceedings{patel2024splitwise,
-  title     = {Splitwise: Efficient Generative LLM Inference Using Phase Splitting},
-  author    = {Pratyush Patel and Esha Choukse and Chaojie Zhang and Aashaka Shah
-               and {\'I}{\~n}igo Goiri and Saeed Maleki and Ricardo Bianchini},
-  booktitle = {Proceedings of the 51st Annual International Symposium on
-               Computer Architecture (ISCA '24)},
-  year      = {2024},
-  url       = {https://arxiv.org/abs/2311.18677}
-}
-```
-
----
-
-## Omission 3: Mooncake — Transfer Engine Internals
-
-**Source:** `L3/03_mooncake_fast25.md`
-**Venue:** USENIX FAST 2025
-**Why omitted from COMBINEDL1L2.md:** COMBINEDL1L2.md names Mooncake as a transfer backend and cites the 27–107ms transfer window numbers. The mechanics that produce those numbers — GPUDirect RDMA path, multi-NIC pooling, topology-aware NIC selection, NVLink transport — are L3 detail that is not necessary for understanding how to launch or evaluate a disaggregated cluster.
-
----
-
-### GPUDirect RDMA: The Key to Throughput
-
-Without GPUDirect, KV cache transfer follows a CPU-mediated path:
+The fundamental challenge SGMV solves is computing a batched matrix-vector multiply where each row of the batch matrix uses a different weight matrix:
 
 ```
-Prefill GPU VRAM → CPU RAM (PCIe) → NIC → network → NIC → CPU RAM (PCIe) → Decode GPU VRAM
+For a batch of N tokens, where token i uses adapter (Aᵢ, Bᵢ):
+
+Standard GEMM:          X @ W.T           — all rows use same W
+SGMV (down-project):    [x₀ @ A₀.T,       — each row uses different A
+                          x₁ @ A₁.T,
+                          ...
+                          xₙ @ Aₙ.T]
+SGMV (up-project):      [h₀ @ B₀.T,       — each row uses different B
+                          h₁ @ B₁.T,
+                          ...
+                          hₙ @ Bₙ.T]
 ```
 
-With GPUDirect RDMA, the CPU is entirely bypassed:
+### The Naive Approach and Its Cost
 
-```
-Prefill GPU VRAM → NIC → network → NIC → Decode GPU VRAM
-```
+Without SGMV, serving a batch with K distinct adapters requires K separate kernel launches:
 
-This eliminates two PCIe crossings and removes the CPU as the bottleneck. For 40 GB of KV data (LLaMA3-70B at 128K context), GPUDirect RDMA reduces transfer time from ~15 seconds (PCIe double-copy path) to the NIC line-rate limit.
-
-### Topology-Aware Path Selection
-
-Modern inference servers have multiple CPU sockets, DRAM banks, GPUs, and RDMA NICs. Data can be transferred from any NIC to any GPU, but with different bandwidths depending on the PCIe/UPI path.
-
-Mooncake's topology-aware path selection:
-1. On startup, each server generates a topology matrix (GPU-NIC affinity, NUMA distances, PCIe bandwidth).
-2. The matrix is broadcast to all cluster members.
-3. For each KV transfer request, the Transfer Engine selects the NIC(s) with the highest bandwidth path to the source/destination GPU.
-
-This avoids the common failure mode where data crosses a PCIe/UPI bridge unnecessarily, which can halve effective bandwidth.
-
-### Multi-NIC Pooling
-
-A single RDMA NIC on an H100 server provides ~200 Gbps. Servers typically have 4–8 NICs. Mooncake's Transfer Engine supports using **multiple RDMA NICs simultaneously** for a single transfer:
-
-- Large transfers (>1 GB) are internally split into slices.
-- Each slice is assigned to a different NIC based on topology affinity.
-- All slices are submitted in parallel; completion is tracked independently.
-- If one NIC fails or becomes congested, the TE retries on other NICs.
-
-For 8-NIC servers, this can aggregate up to ~1.6 Tbps of theoretical RDMA bandwidth per node — sufficient to transfer even very large KV caches (128K-token DeepSeek-V3 context) in a few seconds.
-
-### NVLink Transport for NVL72
-
-The NVIDIA GB200 NVL72 rack interconnects 72 GPUs with rack-scale NVLink (MNNVL). Mooncake supports NVLink as a transfer protocol, bypassing InfiniBand entirely for within-rack KV transfers:
-
-```bash
-export SGLANG_MOONCAKE_CUSTOM_MEM_POOL=NVLINK
-export MC_FORCE_MNNVL=True
-```
-
-NVLink provides ~10× higher bandwidth than InfiniBand (900 GB/s aggregate vs ~800 Gbps per port) and lower latency. For NVL72 deployments, NVLink transfer is the recommended configuration.
-
-### Disaggregated KV Cache Pool (Beyond the Transfer Engine)
-
-Mooncake adds a second tier of disaggregation: beyond separating prefill/decode clusters, it builds a **distributed KVCache pool** from underutilised CPU DRAM and SSD resources across the GPU cluster. This enables prefix caching that survives node failures and can be shared across all prefill and decode instances — functionally similar to SGLang's HiCache but at cluster scale.
-
-**Prediction-based early rejection**: in highly overloaded conditions, Mooncake predicts whether an incoming request can be served within SLO before accepting it, rejecting those it cannot serve early to preserve headroom. SGLang's current disaggregation mode does not implement this.
-
-### Production Results
-
-- Kimi service: 75% more requests vs baseline; up to 525% throughput increase in long-context scenarios.
-- Kimi K2 (128 H200, July 2025): 224,000 tokens/second prefill, 288,000 tokens/second decode.
-
-**BibTeX:**
-```bibtex
-@inproceedings{moonshot2025mooncake,
-  title     = {Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving},
-  author    = {{Moonshot AI} and {MadSys Group, Tsinghua University}},
-  booktitle = {23rd USENIX Conference on File and Storage Technologies (FAST 25)},
-  year      = {2025},
-  url       = {https://arxiv.org/abs/2407.00079}
-}
-```
-
----
-
-## Omission 4: NVIDIA Dynamo — 4-Plane Architecture and KV-Aware Routing
-
-**Source:** `L3/04_nvidia_dynamo_nixl.md`
-**Why omitted from COMBINEDL1L2.md:** COMBINEDL1L2.md names Dynamo as a production framework built around disaggregation. The 4-plane architecture (request, control, discovery, event planes) and KV-aware routing internals are enterprise orchestration concerns beyond what someone needs to understand or launch a disaggregated SGLang cluster.
-
----
-
-### Dynamo's Central Thesis
-
-> "Disaggregated serving requires not just a transfer engine but a full orchestration layer" with separate planes for requests, control, discovery, and events.
-
-### The 4-Plane Architecture
-
-**Request Plane** — the data path:
-1. Client → Frontend → Router
-2. Router chooses a Prefill worker
-3. Prefill computes KV, returns transfer metadata
-4. Router chooses a Decode worker
-5. Decode receives KV via NIXL transfer
-6. Decode streams output tokens back through Frontend to Client
-
-**Control Plane (Planner)** — dynamic pool sizing:
-- Monitors real-time SLO violation rates: TTFT P95 > TTFT_SLO → scale prefill pool.
-- Issues scale-up/scale-down commands to Kubernetes or bare-metal scheduler.
-- Uses a feedback control loop with configurable reaction time and cooldown.
-- SGLang's disaggregation currently has no equivalent; scale-out/scale-in is manual.
-
-**Discovery Plane** — worker registration via etcd leases:
-- Each worker publishes its endpoint, role (prefill/decode), and current load state.
-- Lease TTL: 10 seconds (configurable). Worker death → lease expires → router removes it.
-- New workers start serving within one lease period after registration — no manual router reconfiguration.
-- SGLang's router uses a static list of prefill/decode endpoints via CLI flags.
-
-**Event Plane** — asynchronous state propagation:
-- KV cache hit/miss signals, SLO violation alerts, worker availability changes.
-- Router subscribes to cache state change events rather than polling each worker.
-- This is what makes KV-aware routing scalable: the routing table updates via events, not polling.
-
-### KV-Aware Routing: Dynamo's Key Innovation
-
-Unlike round-robin, Dynamo's Router tracks **KV cache state** across workers:
-- Each prefill worker maintains a local KV cache (similar to SGLang's RadixCache).
-- The Router tracks which prefixes are cached on which workers.
-- For each incoming request, the Router routes to the prefill worker with the **highest prefix overlap** — avoiding KV recomputation.
-
-SGLang's router currently uses round-robin; KV-aware routing is a planned enhancement. Dynamo has this built into its Router design from the start.
-
-### NIXL: The KV Transfer Library
-
-NIXL (NVIDIA Inference Xfer Library) is Dynamo's KV transfer library, also supported natively by SGLang (`--disaggregation-transfer-backend nixl`) and vLLM (`NixlConnector`).
-
-**Core abstraction — Transfer Agent**: each server process runs one. The agent manages:
-1. **Memory Section**: unified view of all registered memory — GPU VRAM (GPUDirect RDMA), CPU DRAM (pinned), local NVMe, remote storage (NVMe-oF or S3).
-2. **Transfer Backend Interface**: pluggable backends — UCX (RDMA InfiniBand/RoCEv2), NVIDIA Magnum IO GPUDirect Storage (GDS), TCP, NVLink. Automatically selects the best backend based on source/destination memory types.
-3. **Metadata Handler**: exchanges registration metadata between agents via etcd. Metadata is cached to avoid per-transfer latency.
-
-**Async transfer API**:
 ```python
-# Submit non-blocking write
-handle = agent.transfer_submit_write(src_addr, dst_addr, size)
-
-# Check completion without blocking
-status = agent.transfer_check_status(handle)
+# Naive: O(K) kernel launches per layer
+for adapter_id, token_indices in token_groups_by_adapter.items():
+    A = adapter_weights[adapter_id]["A"]
+    B = adapter_weights[adapter_id]["B"]
+    x_group = x[token_indices]          # gather
+    h = x_group @ A.T @ B.T * scale    # two GEMMs
+    out[token_indices] += h             # scatter
 ```
 
-This async model allows compute and transfer to overlap — the decode server can begin processing already-transferred layers while later layers are still in transit.
+With K=50 adapters per batch, this is 100 kernel launches per layer (A and B separately), per forward pass. Each launch has fixed overhead (~5–20μs on modern GPUs for kernel scheduling). For 32 layers × 2 projections × 50 adapters = **3,200 kernel launches per token step**. Even at 10μs each, that is 32ms of pure scheduling overhead — comparable to the entire decode step.
 
-**NIXL benchmarking tools:**
-- **NIXLBench**: model-agnostic bandwidth/latency benchmark; sweeps block sizes and batch sizes; reports bandwidth + latency percentiles (P50/P95/P99).
-- **KVBench**: LLM-aware profiler; auto-calculates exact KV I/O size for supported models (LLaMA, Mistral, DeepSeek) and generates ready-to-run NIXLBench commands.
+### The SGMV Algorithm
 
-### Dynamo Benchmark Result
+SGMV fuses all adapter computations into a single kernel launch:
 
-| Metric | Result |
-|---|---|
-| Requests served (DeepSeek-R1, GB200 NVL72) | Up to **30× more requests** vs collocated |
+**Step 1: Build segment metadata**
 
-The 30× improvement comes from combining disaggregation with NVLink-speed KV transfer on GB200 NVL72.
-
----
-
-## Omission 5: SARATHI — Chunked Prefill Mechanics and Pipeline Analysis
-
-**Source:** `L4/01_sarathi_osdi24.md`
-**Venue:** USENIX OSDI 2024
-**Why omitted from COMBINEDL1L2.md:** COMBINEDL1L2.md describes chunked prefill as "the scheduling workaround" and "the prior art" that reduces but cannot eliminate interference. The mechanics of how chunks are constructed, scheduled, and interleaved with decode steps — and the pipeline bubble reduction analysis — are L4 material needed only by practitioners building or extending a scheduler.
-
----
-
-### The Problem SARATHI Addresses
-
-Standard LLM inference suffers from two inefficiencies:
-1. **Head-of-line blocking**: a single long prefill (10K-token prompt) monopolises the GPU for hundreds of milliseconds; all decode requests are blocked.
-2. **Pipeline parallelism bubbles**: large prefill microbatches have variable duration, creating imbalanced stage times.
-
-### Chunked Prefill Mechanics
-
-Instead of one large prefill step, SARATHI splits prefill into **fixed-size chunks** scheduled across multiple steps:
-
-```
-Standard: [PPPPPPPPPPPP | D D D D D D D D D]
-           ← 12 prefill tokens →  ← decode →
-           One prefill blocks all decodes for entire duration.
-
-SARATHI:  [PPPP | D D D D] → [PPPP | D D D D] → [PPPP | D D D D]
-          Chunk 1 + decodes   Chunk 2 + decodes   Chunk 3 + decodes
+Before the kernel launches, build arrays describing each adapter's tokens:
+```python
+# seg_starts[i] = index into the batch where adapter i's tokens begin
+# seg_lengths[i] = how many tokens use adapter i
+# adapter_ptr[i] = GPU memory pointer to adapter i's weight matrix
 ```
 
-**Decode-maximal batching**: each batch contains one prefill chunk (saturates GPU FLOP throughput during the chunk) + as many decode requests as fit in remaining KV memory. Decode requests "piggyback" on the compute wave — their incremental compute cost is an order of magnitude lower.
+**Step 2: Single kernel launch**
 
-### Pipeline Bubble Reduction
-
-Chunked prefill ensures every stage in a pipeline-parallel setup receives a uniformly-sized chunk, eliminating microbatch duration imbalance:
-- **6.29× pipeline bubble reduction** on GPT-3 (175B) with PP=8
-- **1.91× end-to-end throughput improvement** from the bubble reduction alone
-
-### Results
-
-| Model | Metric | Improvement |
-|---|---|---|
-| LLaMA-13B (A6000) | Decode throughput | **Up to 10×** |
-| LLaMA-13B (A6000) | End-to-end throughput | **Up to 1.33×** |
-| LLaMA-33B (A100) | Decode throughput | **4.25×** |
-| LLaMA-33B (A100) | End-to-end throughput | **1.25×** |
-| GPT-3 (pipeline parallel) | Pipeline bubbles | **6.29× reduction** |
-
-### What Chunked Prefill Cannot Fix
-
-| Problem | SARATHI (chunked prefill) | PD Disaggregation |
-|---|---|---|
-| Head-of-line blocking | Reduced (chunk duration, not full prefill) | Eliminated (prefill on separate GPU) |
-| Decode TPOT increase during prefill | Reduced but non-zero | Zero (decode GPU never runs prefill) |
-| Resource coupling | Still coupled (same GPU, same TP config) | Decoupled (independent TP per phase) |
-| Hardware optimisation | Cannot use different hardware per phase | Can use compute-optimised vs memory-optimised GPUs |
-| TPOT variance | Still variable (chunk scheduling adds jitter) | Stable (decode GPU is dedicated) |
-
-**The key limit**: even a 1-token prefill chunk requires exclusive GPU access for one forward step; decode is blocked during that step. DistServe measures that with chunked prefill, collocated systems still show **3–5× higher TPOT variance** vs disaggregated systems under production SLO constraints.
-
-**In SGLang's PD disaggregation**: the prefill server uses chunked prefill via `--chunked-prefill-size` to limit step duration, ensuring the prefill server doesn't take arbitrarily long on very large prompts before KV transfer can begin.
-
-**BibTeX:**
-```bibtex
-@inproceedings{agrawal2024sarathi,
-  title     = {{SARATHI}: Efficient LLM Inference by Piggybacking Decodes
-               with Chunked Prefills},
-  author    = {Amey Agrawal and Ashish Panwar and Jayashree Mohan
-               and Nipun Kwatra and Bhargav S. Gulavani and Ramachandran Ramjee},
-  booktitle = {18th USENIX Symposium on Operating Systems Design and
-               Implementation (OSDI 24)},
-  year      = {2024},
-  url       = {https://arxiv.org/abs/2308.16369}
-}
+```
+sgmv_kernel(
+    X,                    # input activations  [N, in_dim]
+    out,                  # output buffer      [N, out_dim]
+    adapter_weights_A,    # all A matrices concatenated  [K × r, in_dim]
+    adapter_weights_B,    # all B matrices concatenated  [K × out_dim, r]
+    seg_starts,           # segment start indices        [K]
+    seg_lengths,          # segment lengths              [K]
+    scaling               # lora_alpha/r
+)
 ```
 
----
+**Step 3: Thread block assignment**
 
-## Omission 6: TaiChi — SLO-Regime Framework and Hybrid Switching
+Each CUDA thread block is assigned to one segment (one adapter's tokens):
+- Block processes segment `i` covering tokens `seg_starts[i]:seg_starts[i]+seg_lengths[i]`
+- Block loads adapter A matrix from `adapter_weights_A[i*r:(i+1)*r, :]`
+- Block computes `x_segment @ A.T` → low-rank intermediate `h_seg ∈ ℝ^{seg_len × r}`
+- Block computes `h_seg @ B.T * scale` → adapter delta `delta_seg ∈ ℝ^{seg_len × out_dim}`
+- Block writes `delta_seg` to `out[seg_starts[i]:seg_starts[i]+seg_lengths[i], :]`
 
-**Source:** `L4/02_taichi_agg_vs_disagg.md`
-**Why omitted from COMBINEDL1L2.md:** COMBINEDL1L2.md section 11 ("When Disaggregation Makes Things Worse") covers the failure modes at L1 level: short prompts, high prefix cache hit rates, and too few GPUs. The SLO-regime framework — when tight TTFT favours aggregation and tight TPOT favours disaggregation — and TaiChi's hybrid switching mechanism are L4 material. The framework is also the most rigorous answer to "when not to disaggregate", going deeper than the L1 decision heuristics.
+This gives one kernel launch per layer per projection matrix, regardless of K.
 
----
+### Why It's Fast: Operational Intensity
 
-### The Central Question
+For a segment of `s` tokens using an adapter with rank `r` and output dimension `d`:
+- FLOPs: `2 × s × r × d` (down-project) + `2 × s × r × d` (up-project) = `4 × s × r × d`
+- Bytes read: `s × in_dim × 2` (X) + `r × in_dim × 2` (A) + `out_dim × r × 2` (B)
 
-Since 2024, two camps have produced competing optimisations:
-- **PD Aggregation** (Orca, SARATHI/Sarathi-Serve): co-locate, manage interference through chunked prefill.
-- **PD Disaggregation** (DistServe, Splitwise, Mooncake, NVIDIA Dynamo): physically separate, eliminate interference entirely.
+For large segments (high request volume for one adapter), the operational intensity grows linearly with `s` — the segment effectively becomes a standard GEMM with high intensity. For small segments (one request per adapter), intensity drops. SGMV handles both cases in the same kernel; the overhead is proportional to the number of segments (adapters), not the number of tokens.
 
-TaiChi settles the debate empirically and theoretically.
+### BGMV: The Decode-Phase Variant
 
-### The SLO-Regime Framework
+For single-token-per-request decode steps, each "batch" is a list of single-row matrices. The full SGMV thread block strategy over-provisions CUDA resources for these tiny GEMMs. BGMV (Batched Gather Matrix-Vector Multiplication) is a SGMV variant optimised for batch size 1 per adapter:
 
-**When PD Aggregation is Optimal — tight TTFT + relaxed TPOT:**
-- All GPUs contribute to prefill simultaneously → low TTFT.
-- TPOT violations from decode interference are tolerable.
-- Aggregation achieves maximum GPU utilisation by batching prefill and decode together.
-- Disaggregation would hurt TTFT because fewer GPUs handle prefill (only the prefill pool).
+- Uses one warp (32 threads) per adapter segment instead of one full thread block
+- Loads A matrix into shared memory once per adapter across all warps in the block
+- Multiple adapters' single-token computations are co-scheduled in the same thread block
 
-**When PD Disaggregation is Optimal — tight TPOT + relaxed TTFT:**
-- Dedicated decode pool is never interrupted by prefill → stable TPOT.
-- Higher TTFT is acceptable.
-- Aggregation causes prefill interference to spike TPOT, violating the strict TPOT SLO.
+For decode-dominated workloads (most production serving), BGMV outperforms SGMV. vLLM uses BGMV as its default; SGLang's Chunked SGMV (`csgmv`) hybridises the two approaches by chunking prefill tokens to use BGMV even during prefill.
 
-**The Balanced SLO Problem — tight TTFT + tight TPOT:**
-- PD aggregation: TPOT violations due to prefill interference.
-- PD disaggregation: TTFT violations because fewer instances handle prefill.
-- Neither can satisfy both SLOs at the same request rate.
+### The Layer 20 Masked Alternative vs SGMV
 
-### TaiChi's Solution: Hybrid-Mode Inference
-
-TaiChi divides the GPU pool into dynamic categories:
-- **P-heavy workers**: primarily process prefill batches.
-- **D-heavy workers**: primarily process decode batches.
-
-In **aggregation mode**: all workers process mixed P+D batches (SARATHI-style).
-In **disaggregation mode**: fixed split; KV transferred between pools.
-In **hybrid mode** (TaiChi's contribution): the P-heavy/D-heavy split is **dynamic** — adjustable in response to real-time SLO violation signals.
-
-**SLO monitoring loop:**
-```
-Monitor TTFT violations → too many → shift some D-heavy workers to P-heavy
-Monitor TPOT violations → too many → shift some P-heavy workers to D-heavy
-At equilibrium: minimum workers of each type for both SLOs to be satisfied
-```
-
-### Results
-
-| Metric | TaiChi vs State-of-the-Art |
-|---|---|
-| Goodput improvement | **Up to 77% over SOTA** |
-| TTFT reduction vs PD disaggregation | **Up to 13.2×** (disaggregation has too-high TTFT when TTFT SLO is tight) |
-| TPOT reduction vs PD aggregation | **Up to 1.69×** |
-
-### The SLO Decision Matrix
-
-| Workload type | TTFT constraint | TPOT constraint | Recommended approach |
+| | Layer 20 float mask | SGMV | BGMV |
 |---|---|---|---|
-| Chatbot (responsiveness matters) | Tight | Relaxed | PD Aggregation (SARATHI-style) |
-| Code streamer (smooth output) | Relaxed | Tight | PD Disaggregation |
-| Agentic AI (long chains, low latency) | Tight | Tight | TaiChi hybrid or large disaggregation cluster |
-| Batch inference (offline) | Relaxed | Relaxed | Aggregation (maximise throughput) |
-| RAG with long prompts | Moderate | Tight | PD Disaggregation |
-| Multi-turn chat | Moderate | Moderate | TaiChi or cache-aware aggregation |
+| Kernel launches per layer | 1 (always, dense) | 1 (fused) | 1 (fused) |
+| Tokens computed | All N (base + LoRA) | Only LoRA tokens | Only LoRA tokens |
+| Extra FLOPs | O(N × r × d) always | O(N_lora × r × d) | O(N_lora × r × d) |
+| Implementation | 5 lines Python | ~500 lines CUDA | ~300 lines CUDA |
+| Multiple adapters | Not supported | Supported | Supported |
 
-### PPD Disaggregation: Three-Way Split for Multi-Turn
-
-TaiChi also introduces PPD (Prefill-Prompt-Decode) disaggregation for multi-turn serving — a **third worker type** (Prompt worker) specifically for context history KV loading/computation:
-
-```
-P worker (Prompt)  → handles context history KV loading/computation
-P worker (Prefill) → handles new-token KV computation (append prefill)
-D worker (Decode)  → handles autoregressive generation
-```
-
-In long multi-turn conversations, the context prefill (re-processing thousands of historical tokens) dominates prefill compute. Offloading it to a dedicated worker prevents it from blocking new-request prefills. This is not yet implemented in SGLang production mode.
-
-**BibTeX:**
-```bibtex
-@article{wang2025taichi,
-  title   = {Prefill-Decode Aggregation or Disaggregation?
-             Unifying Both for Goodput-Optimized LLM Serving},
-  author  = {Chao Wang and others},
-  journal = {arXiv preprint arXiv:2508.01989},
-  year    = {2025},
-  url     = {https://arxiv.org/abs/2508.01989}
-}
-```
+For 100 tokens with 10% needing LoRA: mask wastes 90% of extra FLOPs; SGMV wastes 0%.
 
 ---
 
-## Omission 7: vLLM — Connector Architecture and KV Transfer Abstraction
+## Omission 2: S-LoRA — Unified Paging Formal Analysis and Tensor Parallelism
 
-**Source:** `L4/03_vllm_disagg_connector.md`
-**Why omitted from COMBINEDL1L2.md:** COMBINEDL1L2.md covers SGLang's launch commands (`--disaggregation-mode`, `--disaggregation-transfer-backend`) and the handshake protocol in enough detail to deploy and operate a cluster. vLLM's 6-connector design, `BaseKVConnector` abstraction, `KVLookupBufferBase`, and `--kv-transfer-config` schema are reference material for engineers writing or extending a connector — not for operators deploying one.
+**Source:** `L3/03_slora_mlsys24.md`
+**Venue:** MLSys 2024
+**Why omitted from COMBINEDL1L2.md:** COMBINEDL1L2.md explains how SGLang's `max_loras_per_batch` and `lora_eviction_policy` work — the user-facing controls for S-LoRA's memory management. The formal proof that Unified Paging eliminates fragmentation, the queuing model for adapter loading latency, the specific page allocation algorithm, and the tensor parallel sharding derivation are L3 material for practitioners extending or debugging the memory subsystem.
 
 ---
 
-### Why vLLM's Implementation Matters
+### The Fragmentation Problem: Why Naive Allocation Fails
 
-vLLM's disaggregated prefilling was the first open-source implementation of inter-instance KV transfer (building on Splitwise's prototype PR #2809). Its Connector/LookupBuffer abstraction is the reference design for how any inference framework should expose KV transfer. SGLang's PD disaggregation follows the same conceptual architecture (prefill node = KV producer, decode node = KV consumer) but with tighter SGLang-specific integration.
+Without paged allocation, adapter weights are stored in contiguous GPU memory regions:
 
-> **Important note from vLLM docs:** "Disaggregated prefill DOES NOT improve throughput. It improves latency SLO compliance and decouples TTFT from ITL." — This is the clearest canonical statement of what disaggregation optimises.
+```
+Initial state (after loading 4 adapters of different ranks):
+┌────────────────────────────────────────────────────────────┐
+│ [Adapter A: 200MB] [Adapter B: 50MB] [Adapter C: 400MB] [Adapter D: 100MB] │
+└────────────────────────────────────────────────────────────┘
+  Total used: 750MB  |  Free: 250MB (at end)
 
-### The 6 Supported Connectors
+After evicting B and C (LRU):
+┌────────────────────────────────────────────────────────────┐
+│ [Adapter A: 200MB] [        FREE: 450MB       ] [Adapter D: 100MB] │
+└────────────────────────────────────────────────────────────┘
+  Free: 450MB total — but it's non-contiguous!
 
-| Connector | Transport | Use case |
-|---|---|---|
-| **NixlConnector** | RDMA InfiniBand/RoCEv2 via UCX | Default high-performance GPU-to-GPU transfer in production |
-| **MooncakeConnector** | RDMA, NVLink, TCP via Mooncake TE | Multi-NIC pooling and topology-aware path selection |
-| **P2pNcclConnector** | NCCL P2P (PCIe or NVLink) | Clusters without RDMA NICs; requires a proxy process |
-| **LMCacheConnectorV1** | NIXL + LMCache storage | Cross-engine KV sharing + disaggregated prefilling unified |
-| **ExampleConnector** | Reference implementation | Starting template for custom connectors |
-| **MultiConnector** | Chains multiple connectors | RDMA → NCCL fallback; NIXL + LMCache combined |
+New request for Adapter E (rank=64, size=600MB):
+  Cannot allocate — largest contiguous free block = 450MB < 600MB
+  Even though total free (550MB) > 600MB is FALSE (only 450MB) → OOM
+```
 
-### The BaseKVConnector Abstraction
+With non-contiguous fragmented VRAM, the server experiences OOM despite having free memory.
+
+### Unified Paging: The Solution
+
+Unified Paging manages both KV cache entries and adapter weights in the same pool of fixed-size pages:
 
 ```python
-class BaseKVConnector(ABC):
-    def send_kv_caches_and_hidden_states(
-        self, model_executable, model_input, kv_caches, hidden_or_intermediate_states
-    ) -> None: ...
+PAGE_SIZE = 16MB  # configurable, trades fragmentation vs overhead
 
-    def recv_kv_caches_and_hidden_states(
-        self, model_executable, model_input, kv_caches
-    ) -> Tuple[torch.Tensor, bool]: ...
+class UnifiedMemoryPool:
+    def __init__(self, total_vram_after_base_model):
+        n_pages = total_vram_after_base_model // PAGE_SIZE
+        self.free_pages = list(range(n_pages))
+        self.allocated = {}  # id → [page_ids]
 
-    def close(self) -> None: ...
+    def allocate(self, item_id, size_bytes):
+        n_pages = math.ceil(size_bytes / PAGE_SIZE)
+        if len(self.free_pages) < n_pages:
+            raise OOMError("not enough pages")
+        pages = self.free_pages[:n_pages]
+        self.free_pages = self.free_pages[n_pages:]
+        self.allocated[item_id] = pages
+        return pages
+
+    def free(self, item_id):
+        pages = self.allocated.pop(item_id)
+        self.free_pages.extend(pages)  # pages returned to pool
 ```
 
-- **`send_kv_caches`**: called on the prefill instance after the forward pass. Writes KV tensors to the transfer buffer.
-- **`recv_kv_caches`**: called on the decode instance before its forward pass. Returns `(hidden_states, bypass_model_exec)` — if `bypass_model_exec=True`, decode skips its own prefill computation (it already has the KV).
+Because pages are fixed-size and interchangeable, any freed pages are immediately usable for any new allocation — regardless of shape or rank. External fragmentation is impossible.
 
-### The KVLookupBufferBase Abstraction
+### Proof: Unified Paging Is Fragmentation-Free
 
-```python
-class KVLookupBufferBase(ABC):
-    def insert(self, input_tokens, roi, key, value, hidden) -> None: ...
-    def drop_select(self, input_tokens, roi) -> Tuple[...]: ...
-    def close(self) -> None: ...
+**Claim:** With fixed-size paging, the maximum wasted memory is `(n_adapters + n_requests) × PAGE_SIZE`.
+
+**Proof sketch:**
+- Each allocation wastes at most `PAGE_SIZE - 1` bytes of the last page (internal fragmentation)
+- For `n_a` adapters and `n_r` KV cache entries: waste ≤ `(n_a + n_r) × (PAGE_SIZE - 1)`
+- This is O(PAGE_SIZE) per item, not O(item_size) — choosing PAGE_SIZE = 16MB gives ≤16MB waste per item
+- External fragmentation: zero, because any collection of free pages can serve any allocation
+
+**Practical result:** With PAGE_SIZE = 16MB and 1000 adapters, maximum waste is 16 GB from internal fragmentation — but in practice much less because most adapters are much larger than one page.
+
+### The Unified Pool's Benefit: Dynamic Rebalancing
+
+At different times, different items compete for pages:
+
+```
+Heavy prefill phase (many requests, few adapters):
+  KV cache pages: 80%  |  Adapter pages: 20%  ← KV needs more
+
+Heavy adapter switching (cold-start, diverse access):
+  KV cache pages: 40%  |  Adapter pages: 60%  ← Adapters need more
 ```
 
-`insert`: prefill instance inserts KV cache into the buffer.
-`drop_select`: decode instance **atomically** selects and removes the KV cache matching its request. "Drop" ensures each KV cache is consumed exactly once — prevents double consumption.
+With separate pools (vLLM v1 KV pool + fixed adapter pool), each pool must be sized for its own worst case, over-provisioning both. Unified Paging lets the system dynamically rebalance without human tuning.
 
-### The `--kv-transfer-config` JSON Schema
+### Adapter Loading Latency: The Queuing Model
 
-```python
-class KVTransferConfig(BaseModel):
-    kv_connector: str               # Connector class name
-    kv_role: str                    # "kv_producer", "kv_consumer", or "kv_both"
-    kv_rank: int = 0                # Rank within the transfer group
-    kv_parallel_size: int = 2       # Total size of transfer group
-    kv_buffer_size: float = 1e9    # Transfer buffer size in bytes
-    kv_port: str = "14579"          # Port for connector communication
-    kv_connector_extra_config: dict # Connector-specific configuration
+When an adapter is needed but not in GPU memory, the request must wait. S-LoRA models this as an M/M/1 queue:
+
+- Arrivals: requests for cold adapters at rate λ (requests/sec)
+- Service: adapter loading bandwidth B (bytes/sec), adapter size S (bytes)
+- Service time: `μ = B / S` (loadings/sec)
+
+The expected waiting time for a cold-start request:
+
+```
+E[wait] = (λ / μ) / (μ - λ) × (1/μ)    [M/M/1 mean waiting time]
+        = λ × S² / (B × (B - λ×S))
 ```
 
-**`kv_role`** is the most important field:
-- `kv_producer`: this instance is the prefill worker (sends KV)
-- `kv_consumer`: this instance is the decode worker (receives KV)
-- `kv_both`: runs both phases — useful for testing or multi-turn scenarios
+For S = 100MB, B = 10 GB/s (PCIe 4.0 H2D), λ = 5 req/sec:
+```
+μ = 10,000 MB/s / 100 MB = 100 loadings/sec
+E[wait] = 5 × 100² / (100 × (100 - 5×100/100)) = 5 × 10000 / (100 × 95) ≈ 5.3ms
+```
 
-### vLLM vs SGLang Disaggregation Architecture
+This is acceptable. But at λ = 90 req/sec (near saturation):
+```
+E[wait] = 90 × 10000 / (100 × (100 - 90)) = 900,000 / 1000 = 900ms
+```
 
-| Aspect | vLLM | SGLang |
-|---|---|---|
-| Transfer abstraction | `BaseKVConnector` (6 implementations) | `DisaggTransferBackend` (Mooncake, NIXL) |
-| Configuration | JSON via `--kv-transfer-config` | CLI flags `--disaggregation-mode`, `--disaggregation-ib-device` |
-| Router | External (Ray Serve, Dynamo, custom) | Built-in `sglang_router` |
-| MoE support | General MoE | DeepEP + EPLB integration |
-| Multi-connector chaining | MultiConnector | Not yet supported |
+The queue saturates and latency explodes. This is why `--max-loaded-loras` matters: it limits how many adapters are concurrently loaded, preventing queue saturation.
+
+### Tensor Parallelism for LoRA: The Derivation
+
+For tensor-parallel (TP) serving across `t` GPUs, the LoRA weights must be sharded consistently with the base model's TP sharding.
+
+**Column-parallel layers** (`q_proj`, `k_proj`, `v_proj`, `gate_proj`, `up_proj`):
+
+Base weight `W₀ ∈ ℝ^{d×k}` is sharded: GPU `j` holds `W₀[:, j×(k/t):(j+1)×(k/t)]`.
+
+For LoRA: `W₀ + B·A` must be equivalent to the column-parallel split.
+- A has shape `[r, k]` — sharded: GPU `j` holds `A[:, j×(k/t):(j+1)×(k/t)]` (same column split as `W₀`)
+- B has shape `[d, r]` — **replicated**: all GPUs hold all of B
+
+Derivation: `x @ (W₀ + B·A).T = x @ W₀.T + x @ A.T @ B.T`. For column-parallel `W₀`, `x @ W₀.T` requires each GPU to multiply its x shard against its W₀ shard and all-reduce. For LoRA: `(x_shard @ A_shard.T)` is computed locally, then `@ B.T` is computed locally (B is replicated). No extra communication beyond the base model's all-reduce.
+
+**Row-parallel layers** (`o_proj`, `down_proj`):
+
+Base weight `W₀ ∈ ℝ^{d×k}` is sharded by rows: GPU `j` holds `W₀[j×(d/t):(j+1)×(d/t), :]`.
+
+For LoRA:
+- A has shape `[r, k]` — **replicated** (A is small: r × k)
+- B has shape `[d, r]` — sharded: GPU `j` holds `B[j×(d/t):(j+1)×(d/t), :]`
+
+The extra cost vs Punica's single-GPU SGMV: one all-reduce for A's contribution across TP ranks. Cost is proportional to `2 × r × k × sizeof(element)` — tiny (rank-8 adapter: 2 × 8 × 4096 × 2 bytes = 131 KB) compared to the base model's all-reduce (`d × k × 2 bytes`).
+
+This TP strategy is implemented in SGLang's production LoRA serving and described in `L2/01_sglang_lora_docs.md`.
 
 ---
 
-## Omission 8: Expert Parallelism Dispatch Internals (MoE Models)
+## Omission 3: dLoRA — Dynamic Merge/Unmerge Credit Algorithm
 
-**Source:** `L2/02_lmsys_deepseek_96h100.md`
-**Why omitted from COMBINEDL1L2.md:** COMBINEDL1L2.md states that "PD disaggregation is mandatory for MoE models at this scale" and explains the core reason (different dispatch patterns for prefill vs decode). The DeepEP dispatch mode mechanics and EPLB load balancing algorithm are L3 material needed only by engineers adapting disaggregation for other MoE models.
+**Source:** `L4/01_dlora_osdi24.md`
+**Venue:** USENIX OSDI 2024
+**Why omitted from COMBINEDL1L2.md:** COMBINEDL1L2.md section 12 presents the insight that skewed adapter distributions benefit from merging. dLoRA formalises this as a credit-based algorithm with adaptive thresholds and a request-adapter co-migration mechanism. The full algorithm and the theoretical analysis of when to merge are L4 material for practitioners building a multi-adapter scheduler.
 
 ---
 
-### DeepEP Dispatch Mode Conflict
+### The Central Insight: Merge When Traffic Is Skewed
 
-DeepSeek-V3 uses Mixture-of-Experts (MoE) with 256 experts per layer, only 8 activated per token. The expert parallelism communication library (DeepEP) uses two fundamentally different dispatch patterns:
+S-LoRA and Punica always serve adapters in **unmerged mode**:
+```
+h = W₀·x + B·A·x·scale     # base + adapter, computed separately
+```
 
-**Normal mode** (required for prefill):
-- High-throughput all-to-all for large batches
-- Maximises expert computation overlap with communication
-- Designed for compute-intensive, large-batch processing
-- Incompatible with single-token decode steps
+An alternative is **merged mode** — fold the adapter into the base weights:
+```
+W = W₀ + B·A·scale          # one-time merge (O(d×k) time, O(d×k) memory)
+h = W·x                     # single GEMM, zero overhead at inference time
+```
 
-**Low-latency mode** (required for decode):
-- Minimises dispatch latency for small batches (often single-token)
-- Sacrifices throughput for responsiveness
-- Designed for autoregressive generation
-- Incompatible with the large prefill batches that benefit from "normal" mode
+**When is merged better?** When most requests in a time window use the same adapter. The SGMV overhead (extra matmuls, kernel complexity) is a constant tax paid on every token. If 95% of requests use adapter A, serving adapter A in merged mode eliminates that constant tax for 95% of traffic.
 
-When prefill and decode run on the same GPU workers, the server must switch between modes per batch — which cannot be done optimally when the two types of batches are interleaved. The dispatch mode chosen for one phase degrades the other.
+**When is unmerged better?** When request traffic is diverse (each request uses a different adapter). Merged mode can only serve one adapter at a time — batches must be homogeneous. SGMV's overhead is justified because it enables heterogeneous batching.
 
-**PD disaggregation resolves this**: prefill nodes use "normal" mode permanently; decode nodes use "low-latency" mode permanently. Neither compromises the other.
+### The Credit System
 
-For MoE models, this is not an optimisation — it is a **correctness requirement** for achieving optimal throughput.
+dLoRA maintains a **credit counter** for each adapter:
 
-### EPLB: Expert Parallelism Load Balancing
+```python
+credits = defaultdict(float)
+MERGE_THRESHOLD = 50.0
+UNMERGE_THRESHOLD = 10.0
+DECAY_RATE = 0.1  # credits per second decay
 
-Expert load is inherently uneven — some experts are activated far more frequently than others. Without load balancing, the GPUs hosting popular experts become bottlenecks.
+def on_request_arrival(adapter_id):
+    credits[adapter_id] += 1.0
 
-EPLB (Expert Parallelism Load Balancing) redistributes expert computation to balance GPU utilisation:
-- Analyses the expert activation distribution from observed input/output data.
-- Reassigns experts to GPUs to equalise activation frequency across workers.
-- The SGLang DeepSeek deployment configures EPLB using a distribution matching the observed input/output data pattern.
+def on_time_tick(dt):
+    for adapter_id in list(credits.keys()):
+        credits[adapter_id] -= DECAY_RATE * dt
+        if credits[adapter_id] <= 0:
+            del credits[adapter_id]
 
-Without EPLB, some GPUs in the expert parallel group would be idle while others are saturated — reducing the effective throughput of the expert parallelism configuration.
+def should_merge(adapter_id):
+    return credits.get(adapter_id, 0) > MERGE_THRESHOLD
 
-### The 3:9 Prefill-to-Decode Ratio
+def should_unmerge(adapter_id):
+    return credits.get(adapter_id, 0) < UNMERGE_THRESHOLD
+```
 
-The DeepSeek-V3 deployment uses 3 prefill nodes (24 GPUs) and 9 decode nodes (72 GPUs). This 1:3 ratio is the production tuning point for this model at this scale.
+Credits accumulate when requests arrive and decay when they don't. A high-traffic adapter quickly crosses `MERGE_THRESHOLD` and gets merged into its own dedicated worker. If traffic drops, credits decay below `UNMERGE_THRESHOLD` and the worker unmerges to serve heterogeneous traffic.
 
-**Why decode needs more resources than prefill:**
-- Decode runs continuously — every token generation step runs on the decode pool.
-- Prefill is bursty — processes a prompt once, then hands off.
-- At steady state, far more GPU time is consumed by decode than by prefill.
-- The ratio depends on the input/output token length ratio of actual workload: longer outputs → more decode GPU time → higher decode/prefill ratio.
+### The Merge/Unmerge Operation
 
-For a workload with 2,000-token inputs and 500-token outputs (250% decode/prefill ratio by time), a 1:3 GPU ratio matches the compute demands roughly.
+**Merge** (on a worker replica):
+```python
+def merge_adapter(worker, adapter_id):
+    A = adapter_weights[adapter_id]["A"]
+    B = adapter_weights[adapter_id]["B"]
+    scale = adapter_scaling[adapter_id]
+    for layer_idx in range(n_layers):
+        for module in target_modules:
+            delta = B[layer_idx][module].T @ A[layer_idx][module] * scale
+            worker.base_model.layers[layer_idx][module].weight.data += delta.T
+    worker.state = "merged"
+    worker.merged_adapter_id = adapter_id
+```
 
-### SGLang CLI Flags for MoE Disaggregation
+**Unmerge** (restore base weights):
+```python
+def unmerge_adapter(worker):
+    adapter_id = worker.merged_adapter_id
+    # Subtract the previously added delta
+    A = adapter_weights[adapter_id]["A"]
+    B = adapter_weights[adapter_id]["B"]
+    scale = adapter_scaling[adapter_id]
+    for layer_idx in range(n_layers):
+        for module in target_modules:
+            delta = B[layer_idx][module].T @ A[layer_idx][module] * scale
+            worker.base_model.layers[layer_idx][module].weight.data -= delta.T
+    worker.state = "unmerged"
+    worker.merged_adapter_id = None
+```
 
-```bash
-# Prefill node (normal DeepEP mode)
-python -m sglang.launch_server \
-  --model-path deepseek-ai/DeepSeek-V3-0324 \
-  --disaggregation-mode prefill \
-  --moe-a2a-backend deepep \
-  --enable-dp-attention \
-  --tp-size 16 --dp-size 8 \
+Merge/unmerge cost: proportional to number of target layers × module weight sizes. For LLaMA-7B with 7 target modules at 32 layers: ~7 × 32 × 4096² × 2 bytes = 14.7 GB written. At GPU memory bandwidth of 2 TB/s: ~7.3ms. This is why merge/unmerge should not happen on every request — only when the credit system signals sustained high traffic.
+
+### Request-Adapter Co-Migration
+
+**Problem:** Worker replicas can become load-imbalanced due to varying output lengths.
+
+```
+Worker 0: 100 requests, avg output 1000 tokens → busy
+Worker 1: 100 requests, avg output 50 tokens  → idle 95% of the time
+```
+
+Naive load balancing migrates only future requests. dLoRA migrates both the request and its KV cache state to the underloaded worker.
+
+**Migration decision function:**
+```python
+def should_migrate(src_worker, dst_worker, request):
+    cost = kv_cache_bytes(request) / transfer_bandwidth
+    benefit = (src_worker.estimated_completion - dst_worker.estimated_completion)
+    return benefit > cost + MIGRATION_OVERHEAD
+```
+
+Only migrate when the latency reduction exceeds the migration cost. This prevents thrashing (migrating back and forth when workers have similar loads).
+
+**Results:** 57.9× throughput over vLLM; 1.8× lower latency than S-LoRA (which uses static unmerged serving regardless of traffic shape).
+
+---
+
+## Omission 4: CaraServe — CPU-Assisted Prefill During Cold-Start Loading
+
+**Source:** `L4/02_caraserve_2024.md`
+**Why omitted from COMBINEDL1L2.md:** COMBINEDL1L2.md covers the cold-start problem conceptually (Pillar 1 of LoRAX: dynamic loading). CaraServe's specific solution — overlapping CPU prefill with GPU-side adapter loading — requires understanding the CPU-GPU synchronisation model and when CPU prefill is worth the overhead. It is not yet implemented in SGLang or vLLM, making it L4 material for research-track practitioners.
+
+---
+
+### The Cold-Start Timeline Without CaraServe
+
+```
+t=0:  Request arrives for adapter A (not in VRAM)
+t=0:  Start H2D transfer: adapter A → GPU VRAM  (100-500ms for 50-200MB)
+t+Δ: H2D transfer completes
+t+Δ: GPU runs prefill (compute-bound, fast on GPU)
+t+Δ+ε: First token generated
+
+TTFT = H2D_time + GPU_prefill_time + first_decode_step
+     = 100-500ms + 20-200ms + 10-30ms
+     = 130-730ms cold start
+```
+
+### CaraServe's CPU-Overlap Solution
+
+```
+t=0:  Request arrives for adapter A (not in VRAM)
+t=0:  Simultaneously:
+      Thread 1: Start H2D transfer: adapter A → GPU VRAM
+      Thread 2: Start CPU prefill using CPU-resident adapter weights
+t+α: CPU prefill completes (α = CPU prefill time)
+t+β: H2D transfer completes (β = adapter load time)
+t+max(α,β): GPU decode begins using CPU-computed KV state
+             (if α > β: GPU was idle waiting for CPU; still faster than serial)
+             (if β > α: CPU was idle waiting for GPU; overlap fully exploited)
+
+TTFT = max(H2D_time, CPU_prefill_time) + first_decode_step
+     ≈ max(100-500ms, 200-800ms) + 10-30ms
+     ← CPU prefill can be slower than GPU while still hiding H2D cost
+```
+
+### When CPU Prefill Is Worthwhile
+
+CPU prefill is worthwhile if and only if:
+```
+max(H2D_time, CPU_prefill_time) < H2D_time + GPU_prefill_time
+⟺ CPU_prefill_time < H2D_time + GPU_prefill_time
+⟺ CPU_prefill_time - GPU_prefill_time < H2D_time
+```
+
+Since CPU prefill is always slower than GPU prefill (`CPU_prefill > GPU_prefill`), the LHS is positive. The condition becomes: "Is the CPU overhead less than the H2D transfer time?"
+
+**For low-rank adapters and long prompts:** H2D time is dominated by adapter size (small for low rank) while CPU prefill time grows with prompt length. The condition is:
+```
+prompt_length × (CPU_time_per_token - GPU_time_per_token) < adapter_size / H2D_bandwidth
+```
+
+CaraServe includes an offline profiler that maps this condition to a (rank, prompt_length) lookup table, consulted at runtime for each cold-start request.
+
+### CPU-GPU Synchronisation Mechanism
+
+The challenge is safely handing off the KV cache state computed on CPU to the GPU for decode:
+
+```python
+# Pinned (page-locked) memory for fast DMA
+cpu_kv_buffer = torch.empty(kv_shape, pin_memory=True)
+
+# CPU prefill fills cpu_kv_buffer
+cpu_prefill_thread(request, adapter_weights_cpu, cpu_kv_buffer)
+
+# DMA transfer CPU buffer → GPU KV cache (fast, via pinned memory)
+gpu_kv_buffer = cpu_kv_buffer.cuda(non_blocking=True)
+torch.cuda.synchronize()  # wait for DMA
+
+# GPU decode begins — KV cache is ready
+decode_step(request, gpu_kv_buffer)
+```
+
+The pinned memory allocation eliminates the intermediate copy through pageable host memory, reducing DMA transfer overhead by 30–50%.
+
+### Rank-Aware Scheduling
+
+CaraServe prioritises requests based on their expected completion time, accounting for adapter rank:
+
+```python
+def compute_urgency(request, current_time):
+    rank = get_adapter_rank(request.adapter_id)
+    deadline = request.arrival_time + request.ttft_slo
+    remaining = deadline - current_time
+
+    # Higher rank → more compute → needs more lead time
+    compute_estimate = rank * request.prompt_length * FLOPS_PER_TOKEN
+    return compute_estimate / remaining  # higher urgency = schedule first
+```
+
+A rank-64 adapter request arriving at the same time as a rank-8 request with the same SLO deadline gets scheduled first because it requires more GPU time to complete before the deadline.
+
+**Results:** 1.4× average latency speedup; 99% SLO attainment vs 85% for S-LoRA.
+
+---
+
+## Omission 5: LoRA Variant Mathematics — DoRA, rsLoRA, PiSSA, EVA
+
+**Source:** `L2/03_hf_peft_lora.md`
+**Why omitted from COMBINEDL1L2.md:** COMBINEDL1L2.md covers standard LoRA initialisation (Kaiming-uniform for A, zeros for B) and the `lora_alpha/r` scaling. The variant algorithms — DoRA's magnitude/direction decomposition, rsLoRA's `alpha/sqrt(r)` scaling stability analysis, PiSSA's SVD initialisation, EVA's data-driven rank allocation — require engaging with the mathematical motivation for each modification. They are PEFT configuration options that practitioners may need for specific use cases.
+
+---
+
+### rsLoRA: Rank-Stabilised Scaling
+
+**Standard LoRA scaling:** `lora_alpha / r`
+
+At rank `r=8` with `alpha=16`: scale = 2.0
+At rank `r=64` with `alpha=16`: scale = 0.25
+
+The effective scale decreases with rank. When using higher ranks (for more expressive adaptation), the scale factor drops, effectively reducing the adapter's contribution. This creates a counterintuitive situation: higher-rank adapters can have less impact than lower-rank adapters with the same `alpha`.
+
+**rsLoRA scaling:** `lora_alpha / sqrt(r)`
+
+At rank `r=8` with `alpha=16`: scale = 5.66
+At rank `r=64` with `alpha=16`: scale = 2.0
+
+The `1/sqrt(r)` scaling keeps the adapter contribution more stable across ranks. This follows the theory of Neural Tangent Kernels: for width-scaled networks, the correct learning rate scaling is `1/sqrt(width)` rather than `1/width`.
+
+```python
+# Standard LoRA
+config = LoraConfig(r=64, lora_alpha=16, use_rslora=False)
+# scale = 16/64 = 0.25 — very small with high rank
+
+# rsLoRA
+config = LoraConfig(r=64, lora_alpha=16, use_rslora=True)
+# scale = 16/sqrt(64) = 2.0 — reasonable at high rank
+```
+
+**When to use rsLoRA:** When experimenting with ranks > 32, or when standard LoRA fine-tunes are underperforming due to the diminishing scale factor.
+
+### DoRA: Weight-Decomposed Low-Rank Adaptation
+
+Standard LoRA updates a weight matrix with an additive delta `ΔW = B·A`. DoRA decomposes the weight update into two separate components:
+
+```
+Standard LoRA:   W' = W₀ + B·A·scale
+
+DoRA:            W' = m ⊙ (W₀ + B·A·scale) / ||W₀ + B·A·scale||
+                       ↑                    ↑
+                  magnitude              direction
+                  (scalar per column)    (normalised matrix)
+```
+
+- **Direction** is handled by standard LoRA (`B·A` rank decomposition)
+- **Magnitude** is handled by a separate learnable vector `m ∈ ℝ^{out_dim}` (one scalar per output dimension)
+
+This decomposition mirrors how weight updates during full fine-tuning behave: the magnitude and direction of weight changes have different learned patterns. By separating them, DoRA can learn richer adaptations with the same parameter count.
+
+```python
+config = LoraConfig(r=8, lora_alpha=16, use_dora=True)
+# Adds ~out_dim extra parameters per targeted layer for the magnitude vectors
+```
+
+**DoRA overhead:** 1.17–1.39× training time (from decomposed forward pass). For inference: merge the adapter to eliminate overhead:
+
+```python
+merged = peft_model.merge_and_unload()
+# After merging, DoRA = standard model, zero inference overhead
+```
+
+**DoRA runtime inference** (without merging) requires storing the magnitude scaling separately from the B·A delta, which is why Layer 20's `LoRAAdapter.apply()` doesn't directly support DoRA — it would require storing and applying the magnitude vector.
+
+### PiSSA: Principal Singular Values and Singular Vectors
+
+Standard LoRA initialises `B=0, A=random` (identity transform at init). This means the first training steps must "discover" which directions to adapt before making progress.
+
+PiSSA initialises using the **principal singular values** of `W₀`:
+
+```python
+# PiSSA initialisation
+U, S, Vt = torch.linalg.svd(W0)
+
+# A initialised as top-r rows of Vt (principal input directions)
+A_init = Vt[:r, :]                    # [r, k]
+
+# B initialised as top-r columns of U * diag(S[:r])
+B_init = U[:, :r] @ torch.diag(S[:r])  # [d, r]
+
+# Residual: modify W₀ to be the "rest" after removing principal components
+W0_residual = W0 - B_init @ A_init    # [d, k]
+```
+
+Now `B·A` starts at the principal components of `W₀` (the directions with highest variance), and the model is adapted by learning corrections to those components. This is fundamentally different from learning from a zero-delta initialisation.
+
+**Key properties:**
+- `B_init @ A_init = U[:,:r] @ diag(S[:r]) @ Vt[:r,:]` — the rank-r approximation of `W₀`
+- At initialisation: `W_total = W₀_residual + B·A = W₀` — same behaviour as base model
+- But gradients now flow through the principal directions, which converge faster
+
+**Results:** PiSSA converges 2–5× faster than standard LoRA on instruction-following benchmarks. The PiSSA authors attribute this to the adapter starting from the directions of maximum weight variance rather than from zero.
+
+```python
+config = LoraConfig(r=8, init_lora_weights="pissa")
+# WARNING: takes several minutes for SVD on large models
+# Use "pissa_niter_16" for fast approximate SVD
+config = LoraConfig(r=8, init_lora_weights="pissa_niter_16")
+```
+
+### EVA: Data-Driven Adaptive Rank Allocation
+
+Standard LoRA uses the same rank `r` for every targeted layer. EVA allocates different ranks to different layers based on how much adaptation each layer needs.
+
+**EVA procedure:**
+
+1. Run the model on a calibration dataset, recording input activations at each targeted layer
+2. For each layer's activations `X ∈ ℝ^{N×d}`, compute SVD: `U, S, Vt = svd(X.T @ X)`
+3. The "explained variance ratio" for rank `r` at this layer: `EVR(r) = sum(S[:r]) / sum(S)`
+4. Allocate more ranks to layers with lower EVR (they need more capacity to represent the activation distribution)
+
+```python
+from peft import LoraConfig, EvaConfig
+
+config = LoraConfig(
+    r=8,            # default rank
+    init_lora_weights="eva",
+    eva_config=EvaConfig(rho=2.0)  # rho = max allowed rank multiplier
+)
+
+# After EVA analysis:
+# Layer 0 (q_proj): EVR at r=8 is 0.95 → keep r=8
+# Layer 16 (q_proj): EVR at r=8 is 0.40 → needs more → assigned r=16
+# Layer 31 (down_proj): EVR at r=8 is 0.65 → assigned r=12
+```
+
+`rho=2.0` means the maximum rank any layer can receive is `2r`. This prevents extreme rank allocation while allowing meaningful per-layer adaptation.
+
+**When to use EVA:** For fine-tuning on complex tasks where different model components have very different adaptation needs. Adds calibration time upfront but reduces total parameter count for equivalent quality compared to uniform rank.
+
+---
+
+## Omission 6: ServerlessLoRA — Backbone Sharing and Serverless-Specific Optimisations
+
+**Source:** `L4/04_serverlesslora_2025.md`
+**Why omitted from COMBINEDL1L2.md:** COMBINEDL1L2.md does not discuss serverless deployment. ServerlessLoRA's findings (99% weight redundancy in serverless LoRA functions, backbone sharing approach, contention-aware batching) are specific to the serverless execution model (AWS Lambda, Modal, Replicate) and are not applicable to the traditional long-lived server deployment model covered in COMBINEDL1L2.md's SGLang and vLLM sections.
+
+---
+
+### Why Standard Serverless Fails for LoRA
+
+Serverless LLM inference functions run in isolated containers, each loading their own full model:
+
+```
+Without backbone sharing (standard serverless):
+Function 1: [LLaMA-7B base: 14GB] + [adapter_1: 50MB]  = 14.05 GB
+Function 2: [LLaMA-7B base: 14GB] + [adapter_2: 50MB]  = 14.05 GB
+...
+Function N: [LLaMA-7B base: 14GB] + [adapter_N: 50MB]  = 14.05 GB
+```
+
+At N=10 concurrent functions: 140 GB VRAM, with 140 GB spent on 99% identical data (14× the same base model). This is the "massive parameter redundancy" ServerlessLoRA identifies.
+
+### Secure Backbone Sharing
+
+ServerlessLoRA introduces a **shared base model** accessible to all LoRA functions, with OS-level isolation ensuring each function can only access its own adapter weights:
+
+```
+Shared Base Model (14 GB, read-only, mmap-backed):
+  Function 1 → reads W₀ layers + applies adapter_1
+  Function 2 → reads W₀ layers + applies adapter_2
   ...
-
-# Decode node (low-latency DeepEP mode)
-python -m sglang.launch_server \
-  --model-path deepseek-ai/DeepSeek-V3-0324 \
-  --disaggregation-mode decode \
-  --moe-a2a-backend deepep \
-  --enable-dp-attention \
-  --tp-size 16 --dp-size 8 \
-  --max-running-requests 128 \
-  ...
+  Function N → reads W₀ layers + applies adapter_N
 ```
 
-The `--moe-a2a-backend deepep` flag activates DeepEP; `--enable-dp-attention` activates data-parallel attention. Both are required for the DeepSeek-V3 deployment configuration.
+**Security model:**
+- Base model is mapped read-only into each function's address space (kernel-enforced)
+- Adapter weights are private to each function (separate VRAM allocations)
+- KV caches are private (separate VRAM allocations)
+- Functions cannot access each other's adapters or KV caches
+
+VRAM savings:
+```
+Without sharing: N × 14.05 GB
+With sharing:    14 GB + N × 0.05 GB
+Savings at N=10: 140.5 GB → 14.5 GB = 89.6% reduction
+```
+
+### Pre-Loading: Eliminating Cold Start via Prediction
+
+Serverless functions experience cold starts when the container is first initialised. Standard LoRA serving adds **adapter cold start** on top of model cold start:
+
+```
+Cold start without pre-loading:
+  t=0:   Function spins up
+  t=2s:  Base model loaded from object storage (14 GB at ~7 GB/s)
+  t=3s:  Adapter loaded from object storage (50 MB at 7 GB/s)
+  t=3s+ε: First request processed
+
+TTFT = 3+ seconds for cold start
+```
+
+ServerlessLoRA pre-loads adapters **during the function's warm-up period** (before the first request):
+
+```python
+def warm_up():
+    # Load base model (required, cannot skip)
+    load_base_model()
+
+    # Predict and pre-load hot adapters
+    hot_adapters = predict_hot_adapters(recent_traffic_log, top_k=5)
+    for adapter_id in hot_adapters:
+        prefetch_adapter(adapter_id)  # async, during idle time
+
+# When first request arrives:
+def handle_request(request):
+    adapter_id = request.adapter_id
+    if adapter_already_loaded(adapter_id):
+        process_immediately(request)   # warm hit
+    else:
+        load_adapter(adapter_id)       # still cold, but less common
+        process(request)
+```
+
+The prediction uses historical access patterns (same idea as L4/05 Predictive-LoRA's LSTM, but simpler — top-K by recent frequency).
+
+**Cold start reduction:** 68% fewer cold starts in experiments with production-like traces.
+
+### Contention-Aware Batching
+
+When multiple LoRA functions attempt to prefill simultaneously, peak VRAM pressure spikes:
+
+```
+Normal operation: one function active
+  [Base: 14GB] [Adapter A: 50MB] [KV A: 2GB]  → 16.05 GB
+
+Burst: 3 functions active simultaneously
+  [Base: 14GB] [Adapter A: 50MB] [KV A: 2GB]
+              [Adapter B: 50MB] [KV B: 2GB]
+              [Adapter C: 50MB] [KV C: 2GB]  → 20.15 GB
+  ↑ May exceed 20 GB GPU VRAM → OOM
+```
+
+ServerlessLoRA's contention-aware scheduler:
+1. Monitors current VRAM pressure in real time
+2. When contention threshold is reached: offload inactive adapters from VRAM to CPU
+3. Staggers prefill execution: new prefills are queued until current VRAM pressure drops
+4. Priorities based on SLO deadlines — tighter deadlines preempt later ones
+
+**Combined results on Azure trace:**
+- TTFT: 820ms → 115ms (86% reduction)
+- Cost: $12.5/M tokens → $1.4/M tokens (89% reduction)
+- Throughput: 3.2× improvement
+
+---
+
+## Omission 7: Predictive-LoRA — LSTM Traffic Predictor and Page-Based Memory
+
+**Source:** `L4/05_predictive_lora_2025.md`
+**Why omitted from COMBINEDL1L2.md:** COMBINEDL1L2.md does not cover serverless deployment. Predictive-LoRA's LSTM-based traffic prediction and page-based memory management are advanced topics specific to serverless LoRA serving where cold-start frequency is high and adapter access patterns are predictable. The prediction mechanism requires ML training infrastructure that is out of scope for COMBINEDL1L2.md.
+
+---
+
+### The Reactive Loading Problem
+
+S-LoRA and LoRAX use reactive loading: the server starts loading an adapter *after* a request arrives for it. This is optimal for minimising VRAM usage (never load adapters you don't need), but suboptimal for latency when cold starts are frequent.
+
+**Timeline comparison:**
+
+```
+Reactive (S-LoRA):
+  t=0: Request for adapter A arrives
+  t=0: Start H2D transfer (adapter not in VRAM)
+  t+100ms: Transfer completes
+  t+100ms+: Processing begins
+  TTFT penalty: 100ms+ cold start on every cache miss
+
+Proactive (P-LoRA):
+  t=-100ms: LSTM predicts adapter A will be needed
+  t=-100ms: Start H2D transfer (speculative prefetch)
+  t=0: Request for adapter A arrives
+  t=0: Adapter already in VRAM
+  t=0+: Processing begins immediately
+  TTFT penalty: 0ms (if prediction correct)
+```
+
+Proactive loading shifts the cost from latency-critical (request processing) to latency-tolerant (idle time) — the same principle as CPU instruction prefetching.
+
+### The LSTM Traffic Predictor
+
+**Architecture:**
+
+```
+Input at time t (per time window):
+  [r₀(t), r₁(t), ..., rₙ(t)]   — request rates per adapter (n adapters)
+  [c₀(t), c₁(t), ..., cₙ(t)]   — cumulative counts per adapter
+  [hour_of_day, day_of_week]     — temporal features
+
+LSTM hidden state: 64 units × 2 layers (small by design)
+
+Output:
+  [r̂₀(t+1), r̂₁(t+1), ..., r̂ₙ(t+1)]   — predicted rates for next window
+```
+
+**Prediction → prefetch decision:**
+
+```python
+predicted_rates = lstm.predict(current_window)
+threshold = percentile(predicted_rates, 80)  # top 20% by predicted rate
+
+for i, rate in enumerate(predicted_rates):
+    if rate > threshold and adapter_i not in gpu_vram:
+        schedule_prefetch(adapter_ids[i])     # initiate H2D transfer
+    elif rate <= threshold and adapter_i in gpu_vram:
+        mark_evictable(adapter_ids[i])        # LRU eviction candidate
+```
+
+**Training:** Online learning — the LSTM is fine-tuned continuously on new traffic observations, adapting to concept drift (new popular adapters, seasonal patterns). The model checkpoint is tiny (~100KB) and can be updated every few minutes without interrupting serving.
+
+**Why LSTM over simpler predictors:**
+
+| Method | Can model | Limitation |
+|---|---|---|
+| LRU/LFU | Recent/frequent access | Cannot predict future demand before requests arrive |
+| Moving average | Short-term trends | Cannot model multi-day cycles or sudden shifts |
+| LSTM | Long-range dependencies, cycles, trend shifts | Needs training, slightly more complexity |
+
+The LSTM captures patterns like "adapter_A is popular 9am-5pm weekdays, adapter_B spikes after product launches" — patterns that LRU and moving averages miss entirely.
+
+### Page-Based Adapter Memory Management
+
+The second innovation in P-LoRA is treating GPU VRAM as a paged memory space:
+
+```python
+PAGE_SIZE = 64MB  # or configurable per-deployment
+
+class PagedAdapterPool:
+    def __init__(self, total_adapter_vram_bytes):
+        n_pages = total_adapter_vram_bytes // PAGE_SIZE
+        self.pages = [Page(i) for i in range(n_pages)]
+        self.free_list = deque(range(n_pages))
+        self.adapter_pages = {}  # adapter_id → frozenset of page_ids
+
+    def allocate(self, adapter_id, adapter_size_bytes):
+        n = math.ceil(adapter_size_bytes / PAGE_SIZE)
+        if len(self.free_list) < n:
+            self._evict_lru_until(n)
+        page_ids = [self.free_list.popleft() for _ in range(n)]
+        self.adapter_pages[adapter_id] = frozenset(page_ids)
+        return page_ids
+
+    def evict(self, adapter_id):
+        for pid in self.adapter_pages.pop(adapter_id):
+            self.free_list.append(pid)
+
+    def _evict_lru_until(self, needed):
+        while len(self.free_list) < needed:
+            lru_id = self.lru_tracker.least_recent()
+            self.evict(lru_id)
+```
+
+**Why pages eliminate fragmentation:**
+
+Adapters of different ranks have different sizes (`r=4 → ~25MB, r=64 → ~400MB`). Without pages, repeated load/evict cycles fragment VRAM:
+```
+After 100 cycles: 2GB free but in ~50 small non-contiguous gaps
+Cannot allocate a 400MB rank-64 adapter despite having 5× its size available
+```
+
+With PAGE_SIZE=64MB pages, any 7 free pages can serve a 400MB adapter regardless of which pages they are.
+
+**Combined P-LoRA results** (Azure Functions trace):
+- Throughput: 1.52× over S-LoRA
+- TTFT: 35% reduction
+- VRAM utilisation: 87%+ (vs 60-70% for S-LoRA with fragmentation)
+- Cold start rate: 68% reduction (from LSTM prefetching)
+
+---
+
+## Omission 8: Loquetier — Virtualised Module and Unified Fine-Tuning + Serving
+
+**Source:** `L4/03_loquetier_neurips25.md`
+**Venue:** NeurIPS 2025
+**Why omitted from COMBINEDL1L2.md:** COMBINEDL1L2.md covers inference serving only. Loquetier's contribution is specifically for production systems that must simultaneously train new adapters and serve existing adapters from the same GPU cluster. This mixed workload requires gradient computation during serving and coordinated batching of training and inference steps — concerns beyond the scope of COMBINEDL1L2.md's serving-only coverage.
+
+---
+
+### The Gap Loquetier Fills
+
+Prior work (Punica, S-LoRA, dLoRA) focused exclusively on inference serving:
+- Base model: frozen
+- Adapters: inference-only (no gradient computation)
+- Workload: 100% requests, 0% training
+
+Real production systems combine training and serving:
+- Model improvement pipeline: continuously fine-tune adapters on new user data
+- Active learning: update adapter weights based on user feedback in real time
+- RLHF (Reinforcement Learning from Human Feedback): train while serving
+
+Running training and serving on **separate GPU clusters** doubles infrastructure cost and creates a deployment lag (fine-tune on one cluster, deploy to another). Loquetier enables both on the same cluster.
+
+### The Virtualised Module (VM) Design
+
+Loquetier wraps each base model layer in a Virtualised Module that maintains a pool of adapters, each independently tagged for either training or serving:
+
+```python
+class VirtualisedModule(nn.Module):
+    def __init__(self, base_layer: nn.Linear):
+        super().__init__()
+        self.base_layer = base_layer  # frozen, shared
+        self.adapters: Dict[str, LoRAAdapter] = {}
+        # adapter_id → {A, B, mode ("train" | "serve"), requires_grad}
+
+    def add_adapter(self, adapter_id, r, mode="serve"):
+        A = nn.Parameter(torch.zeros(r, self.base_layer.in_features), requires_grad=(mode=="train"))
+        B = nn.Parameter(torch.zeros(self.base_layer.out_features, r), requires_grad=(mode=="train"))
+        self.adapters[adapter_id] = {"A": A, "B": B, "mode": mode}
+
+    def forward(self, x, batch_metadata):
+        base_out = self.base_layer(x)
+
+        # Per-token adapter routing
+        for adapter_id, token_indices in batch_metadata.adapter_groups.items():
+            if adapter_id not in self.adapters:
+                continue
+            A = self.adapters[adapter_id]["A"]
+            B = self.adapters[adapter_id]["B"]
+            mode = self.adapters[adapter_id]["mode"]
+
+            x_group = x[token_indices]
+            if mode == "train":
+                delta = (x_group @ A.T) @ B.T * self.scaling  # gradient flows
+            else:
+                with torch.no_grad():
+                    delta = (x_group @ A.T) @ B.T * self.scaling  # no gradient
+
+            base_out[token_indices] += delta
+
+        return base_out
+```
+
+Key properties:
+- Base layer is **never duplicated** regardless of how many adapters are active
+- Training and serving adapters coexist in the same VM
+- `requires_grad=True` for training adapters — backward pass updates their A and B
+- `torch.no_grad()` for serving adapters — inference has no gradient overhead
+- The VM is agnostic to training algorithm (SGD, Adam, RL)
+
+### The Fused Kernel: One Launch for Training + Serving
+
+The naive VM implementation (above) still has one issue: separate code paths for training and serving tokens create two different kernel launches per layer, one for `requires_grad=True` tokens and one for `no_grad` tokens.
+
+Loquetier's fused kernel handles both in a single launch:
+
+```
+Input batch: [train_tokens: 32, serve_tokens: 128]
+
+Naive:
+  Launch kernel 1: process train_tokens with gradient tracking (32 tokens)
+  Launch kernel 2: process serve_tokens without gradient (128 tokens)
+  → 2 kernel launches, 2 memory round-trips
+
+Fused:
+  Launch single kernel:
+    Thread blocks handle both token types
+    Each thread block checks its token type and sets gradient flag
+    Gradient accumulation buffer allocated only for train tokens
+    Single memory round-trip for all activations
+  → 1 kernel launch, 1 memory round-trip
+```
+
+The single-launch design reduces kernel scheduling overhead (particularly important for many small adapters) and improves memory access locality (base model weights loaded once for the combined batch).
+
+### Training + Serving Batch Construction
+
+The scheduler constructs mixed batches that balance training and serving objectives:
+
+```python
+def build_mixed_batch(training_requests, serving_requests, max_tokens):
+    batch = Batch()
+    remaining = max_tokens
+
+    # SLO-driven serving allocation
+    serving_tokens = min(remaining, slo_driven_serving_quota(serving_requests))
+    batch.add_serving(serving_requests[:serving_tokens])
+    remaining -= serving_tokens
+
+    # Fill remainder with training tokens
+    training_tokens = min(remaining, training_request_size)
+    batch.add_training(training_requests[:training_tokens])
+
+    return batch
+```
+
+The SLO-driven quota ensures serving requests meeting their TTFT/ITL SLOs are prioritised — training tokens fill the remaining capacity. When serving load is low, more of the batch is training; at peak serving load, training gets minimal resources.
+
+### Results
+
+On A100 80 GB with LLaMA-7B:
+
+| Task | Baseline | Loquetier | Improvement |
+|---|---|---|---|
+| Inference only | SOTA co-serving system | Loquetier | **3.0× throughput** |
+| Training only | PEFT | Loquetier | ~1.5× throughput |
+| Unified (training + serving) | PEFT (sequential) | Loquetier | **46.4× SLO attainment** |
+
+The 46.4× SLO attainment improvement is the headline result: PEFT's single-adapter sequential training + serving (alternating between training steps and inference steps) causes massive serving latency violations under any real request load. Loquetier's fused mixed batches maintain both training progress and serving SLOs simultaneously.
+
+---
+
+## Omission 9: InfiniLoRA — Disaggregated LoRA Execution for MoE Models
+
+**Source:** `L4/06_infinilora_2026.md`
+**Why omitted from COMBINEDL1L2.md:** InfiniLoRA represents the frontier of multi-LoRA architecture (April 2026) and requires understanding both PD Disaggregation (Layer 19) and multi-LoRA serving (Layer 20) simultaneously. The disaggregated LoRA Server design, GPU-initiated communication, and MoE LoRA memory analysis require engaging with systems at the intersection of two advanced topics.
+
+---
+
+### Why MoE Models Break Coupled LoRA Serving
+
+For dense models (LLaMA-7B, Qwen3-0.6B), LoRA adds a small fraction of model size:
+
+```
+LLaMA-7B, 7 target modules, rank-8:
+LoRA params = 32 layers × 7 modules × (4096×8 + 8×4096) = 28M params ≈ 56MB
+Base model: 7B params = 14,000 MB
+LoRA overhead: 0.4%
+```
+
+For MoE models (Mixtral-8×7B, DeepSeek-V2), LoRA applied to expert layers scales with expert count:
+
+```
+Mixtral-8×7B, rank-8, with LoRA on expert layers:
+Expert FFN per layer: 8 experts × 2 × 14336 × 4096 = 938M params
+LoRA for experts: 8 experts × (4096×8 + 8×14336) = 1.2M per layer
+32 layers: 38M extra params ≈ 76MB per adapter
+
+BUT: with 64 experts (like in DeepSeek-V2) and rank-16:
+64 experts × 32 layers × 2 × (hidden × rank) ≈ 2.4B LoRA params ≈ 4.8GB per adapter
+```
+
+For a high-rank adapter on a large MoE model, LoRA weights can approach the same scale as the KV cache. S-LoRA's assumption that "adapters are small" breaks down.
+
+### InfiniLoRA's Architecture: The Dedicated LoRA Server
+
+Instead of running LoRA computation on the same GPU as the base model:
+
+```
+Standard (coupled):
+  Base Model GPU 0
+  ┌─────────────────────────────────────────────────────┐
+  │ Base model weights [fixed]  |  LoRA A/B weights [N]  │
+  │ Forward pass                |  SGMV kernels           │
+  │ KV cache                    |                         │
+  └─────────────────────────────────────────────────────┘
+         ↑ VRAM competition between KV cache and LoRA weights for MoE
+
+InfiniLoRA (disaggregated):
+  Base Model GPUs 0-3 (4 GPUs)
+  ┌─────────────────────────────────────────────────────┐
+  │ Base model weights [fixed]                          │
+  │ Forward pass (base contribution only)               │
+  │ Full KV cache budget (no LoRA weights!)             │
+  └─────────────────────────────────────────────────────┘
+          ↕  GPU-initiated RDMA: activations ↓ + deltas ↑
+
+  LoRA Server GPUs 4-7 (4 dedicated GPUs)
+  ┌─────────────────────────────────────────────────────┐
+  │ All adapter A/B weights for all N adapters          │
+  │ SGMV/TP-aware LoRA computation                      │
+  │ No base model weights needed                        │
+  └─────────────────────────────────────────────────────┘
+```
+
+**Why this helps for MoE:**
+- Base model GPUs no longer compete with LoRA weights for VRAM
+- Larger KV cache → larger batch size → better base model GPU utilisation
+- LoRA Server scales independently: add more LoRA Server GPUs as adapter catalog grows
+
+### Critical-Path Optimisation: GPU-Initiated Communication
+
+In standard disaggregated systems, the CPU orchestrates GPU-to-GPU transfers:
+
+```
+CPU-orchestrated (standard):
+  Base GPU → [PCIe to CPU RAM] → [CPU: schedule NCCL] → [PCIe to LoRA GPU]
+  Overhead: ~100μs CPU interrupt + PCIe round trips = ~200μs total
+```
+
+InfiniLoRA uses **GPU-initiated communication** via NCCL's P2P API:
+
+```
+GPU-initiated (InfiniLoRA):
+  Base GPU → [NVLink/InfiniBand RDMA directly to LoRA GPU]
+  Overhead: ~10μs (NVLink P2P latency)
+```
+
+The CPU is entirely bypassed. The GPU triggers the send/receive via CUDA stream primitives:
+
+```cuda
+// On Base Model GPU: send activations to LoRA Server
+ncclSend(activations_ptr, n_elements, ncclFloat16, 
+         lora_gpu_rank, nccl_comm, cuda_stream);
+
+// On LoRA Server GPU: receive and compute delta
+ncclRecv(activations_buffer, n_elements, ncclFloat16,
+         base_gpu_rank, nccl_comm, cuda_stream);
+sgmv_kernel(activations_buffer, adapter_weights, delta_buffer, ...);
+ncclSend(delta_buffer, n_elements, ncclFloat16,
+         base_gpu_rank, nccl_comm, cuda_stream);
+```
+
+The entire communication + LoRA computation is a sequence of CUDA stream operations — no CPU involvement after initial setup. This enables the LoRA Server's work to overlap with the next layer's base model computation.
+
+### SLO-Driven Provisioning
+
+InfiniLoRA includes an offline capacity planner that determines LoRA Server sizing:
+
+```python
+def provision_lora_servers(
+    request_rate_per_adapter: Dict[str, float],  # adapters/sec
+    slo_ttft_ms: float,
+    slo_itl_ms: float,
+    base_model_forward_time_ms: float,
+    adapter_compute_time_per_rank: float,         # ms per token per rank
+    hw_cost_per_gpu_hour: float,
+) -> int:
+    # LoRA computation time per token (across all active adapters):
+    # Sum over active adapters: compute_time × rank × batch_size
+    # Must fit within (slo_itl_ms - base_model_forward_time_ms)
+    
+    headroom_ms = slo_itl_ms - base_model_forward_time_ms
+    lora_work_per_step = sum(request_rate * rank * adapter_compute_time_per_rank
+                             for adapter_id, request_rate in request_rate_per_adapter.items())
+    
+    required_throughput = lora_work_per_step / headroom_ms
+    gpus_needed = math.ceil(required_throughput / lora_server_throughput_per_gpu)
+    return gpus_needed
+```
+
+This offline analysis enables elastic provisioning: scale LoRA Server GPUs up during high-adapter-diversity periods, scale down during homogeneous traffic.
+
+### Evaluation Results
+
+On H100 cluster with DeepSeek-V2 (MoE, 128 experts per layer):
+
+| Metric | S-LoRA (coupled) | InfiniLoRA (disaggregated) |
+|---|---|---|
+| Serviceable request rate | 1× | **3.05×** |
+| Adapters satisfying SLO | 46% | **100%** |
+| Base model GPU VRAM for KV cache | 30% (VRAM crowded by LoRA) | 64% (LoRA on separate GPUs) |
+| Tail latency (P99 TTFT) | High (VRAM pressure causes stalls) | Stable |
+
+The 3.05× serviceable request rate improvement comes from: (1) base GPUs no longer constrained by LoRA VRAM → larger batches, (2) LoRA computation overlaps with base model decode via async GPU-initiated communication, (3) LoRA Server can use dedicated hardware optimised for SGMV (memory-bandwidth-optimised) vs base model hardware (compute-optimised).
+
+### The Disaggregation Progression
+
+InfiniLoRA extends the disaggregation principle from Layer 19 (PD Disaggregation) to the LoRA serving dimension:
+
+| Disaggregated component | Paper | What it separates |
+|---|---|---|
+| Prefill vs Decode | DistServe (OSDI 2024) | Compute-bound vs memory-bound phases |
+| KV cache vs Compute | Mooncake (FAST 2025) | Cache storage vs compute resources |
+| LoRA vs Base model | **InfiniLoRA (2026)** | Adapter compute vs base model compute |
+
+Each disaggregation dimension enables independent scaling and hardware specialisation for its specific resource bottleneck. The trend points toward fully componentised inference infrastructure where each computation type runs on purpose-sized hardware.
